@@ -1,4 +1,5 @@
 -- Export Types --
+print("lib v1")
 export type Window = {
 	Name: string,
 	Keybind: string | Enum.KeyCode | {string | Enum.KeyCode},
@@ -4537,6 +4538,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		SanitizeToken = function(str)
+            print("sanitize",str)
 			str = tostring(str or "Fatality")
 			str = str:gsub("^%s+", "")
 			str = str:gsub("%s+$", "")
