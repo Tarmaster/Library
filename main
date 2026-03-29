@@ -1,5 +1,5 @@
 -- Export Types --
-print("lib v1")
+print("lib v2")
 export type Window = {
 	Name: string,
 	Keybind: string | Enum.KeyCode | {string | Enum.KeyCode},
@@ -4622,6 +4622,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		Refresh = function()
+            print("Refresh")
 			for i,v in next , ScrollingFrame:GetChildren() do
 				if v:IsA('TextButton') then
 					v:Destroy();
@@ -4637,19 +4638,19 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 				if tostring(import.Name) == tostring(v) or import.Name == v then
 					import.Element = button;
 					import.Name = v;
-					import.Element.TextColor3 = Fatality.Colors.Main;
+					import.Element.TextColor3 = Color3.fromRGB(0, 0, 255)--Fatality.Colors.Main;
 					button.Text = "  "..tostring(v);
 				end;
 
 				button.MouseButton1Click:Connect(function()
 					if import.Element then
-						import.Element.TextColor3 = Color3.fromRGB(150, 150, 150);
+						import.Element.TextColor3 = Color3.fromRGB(0, 255, 0);
 						import.Element.Text = " "..import.Name;
 					end;
 
 					import.Element = button;
 					import.Name = v;
-					button.TextColor3 = Fatality.Colors.Main;
+					button.TextColor3 = Color3.fromRGB(255, 0, 0)--Fatality.Colors.Main;
 					button.Text = "  "..tostring(v);
 				end);
 			end;
@@ -4684,8 +4685,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 			end)
 
 			res:SetFiles(files,true);
-            print("no refresh")
-			--res:Refresh();
+			res:Refresh();
 		end,
 
 		DeleteConfig = function(name)
