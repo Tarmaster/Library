@@ -323,6 +323,9 @@ Fatality.ThemeDefaults = {
 	ExpireLabel = Color3.fromRGB(150, 150, 150),   -- Цвет надписи "expires:"
 	ExpireText = Color3.fromRGB(245, 49, 116),     -- Цвет текста подписки (LifeTime / date)
 	DropdownSelected = Color3.fromRGB(255, 106, 133), -- Цвет выбранного элемента дропдауна
+
+    ConfigPicked = Fatality.Colors.Main
+    ConfigSaved = Fatality.Colors.Main
 }
 
 local function deepMerge(dst, src)
@@ -4644,7 +4647,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 
 				button.MouseButton1Click:Connect(function()
 					if import.Element then
-						import.Element.TextColor3 = Color3.fromRGB(0, 255, 0);
+						import.Element.TextColor3 = Color3.fromRGB(150, 150, 150); --dd
 						import.Element.Text = " "..import.Name;
 					end;
 
