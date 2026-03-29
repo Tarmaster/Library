@@ -1,5 +1,5 @@
 -- Export Types --
-print("lib v2")
+print("lib v3")
 export type Window = {
 	Name: string,
 	Keybind: string | Enum.KeyCode | {string | Enum.KeyCode},
@@ -4641,7 +4641,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 				if tostring(import.Name) == tostring(v) or import.Name == v then
 					import.Element = button;
 					import.Name = v;
-					import.Element.TextColor3 = Fatality.Theme.ConfigSaved;
+					import.Element.TextColor3 = Fatal.Theme.ConfigSaved;
 					button.Text = "  "..tostring(v);
 				end;
 
@@ -4653,7 +4653,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 
 					import.Element = button;
 					import.Name = v;
-					button.TextColor3 = Fatality.Theme.ConfigPicked;
+					button.TextColor3 = Fatal.Theme.ConfigPicked;
 					button.Text = "  "..tostring(v);
 				end);
 			end;
