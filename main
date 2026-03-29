@@ -1,5 +1,5 @@
 -- Export Types --
-print("lib v2")
+print("lib v3")
 export type Window = {
 	Name: string,
 	Keybind: string | Enum.KeyCode | {string | Enum.KeyCode},
@@ -324,8 +324,8 @@ Fatality.ThemeDefaults = {
 	ExpireText = Color3.fromRGB(245, 49, 116),     -- Цвет текста подписки (LifeTime / date)
 	DropdownSelected = Color3.fromRGB(255, 106, 133), -- Цвет выбранного элемента дропдауна
 
-    ConfigPicked = Fatality.Colors.Main
-    ConfigSaved = Fatality.Colors.Main
+    ConfigPicked = Fatality.Colors.Main,
+    ConfigSaved = Fatality.Colors.Main,
 }
 
 local function deepMerge(dst, src)
