@@ -4734,7 +4734,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		LoadConfig = function(name)
-            print("LOAD CONFIG ",name)
+            print("LOAD CONFIG ",name,res:NormalizeConfigName(name))
 			name = res:NormalizeConfigName(name)
 			if name == "" then return end
 
@@ -4744,6 +4744,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 			end
 
 			local path = res:GetConfigFilePath(name)
+            print("path",path)
 			if not res:SafeIsFile(path) then
 				warn("[Fatality Config] config file not found:", path)
 				return
