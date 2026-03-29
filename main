@@ -4684,7 +4684,8 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 			end)
 
 			res:SetFiles(files,true);
-			res:Refresh();
+            print("no refresh")
+			--res:Refresh();
 		end,
 
 		DeleteConfig = function(name)
