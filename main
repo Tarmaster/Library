@@ -4532,7 +4532,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 			name = name:gsub("^%s+", "")
 			name = name:gsub("%s+$", "")
 			name = name:gsub("%.json$", "")
-			name = name:gsub("[<>:\"/\\|%?%*]", "_")
+			name = name:gsub("^.*\\", "")  --name:gsub("[<>:\"/\\|%?%*]", "_")
 			return name
 		end,
 
@@ -4734,7 +4734,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		LoadConfig = function(name)
-            print("LOAD CONFIG ",name,res:NormalizeConfigName(name))
+            print("2 LOAD CONFIG ",name,res:NormalizeConfigName(name))
 			name = res:NormalizeConfigName(name)
 			if name == "" then return end
 
