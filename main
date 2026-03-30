@@ -347,7 +347,7 @@ end
 
 -- Подписка UI-объекта на токен темы (live update)
 function Fatality:BindTheme(Fatal, inst: Instance, prop: string, token: string)
-    print("BIND THEME",fatal,inst,prop,token)
+    --print("BIND THEME",fatal,inst,prop,token)
 
 	if not Fatal or not inst then return end
 	Fatal.__themeBinds = Fatal.__themeBinds or {}
@@ -3379,6 +3379,7 @@ function Fatality:CreateElements(Parent : Frame , ZIndex : number , Event : Bind
 			end,
 			Signal = Event.Event:Connect(OpcToggle),
 			SetValue = function(rgb,opc)
+                print("rgb set value")
 				local IsSame = ValueFrame.BackgroundColor3 == rgb or ValueFrame.BackgroundTransparency == opc;
 
 				ValueFrame.BackgroundColor3 = rgb; 
@@ -4543,7 +4544,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		SanitizeToken = function(str)
-            print("sanitize",str)
+           -- print("sanitize",str)
 			str = tostring(str or "Fatality")
 			str = str:gsub("^%s+", "")
 			str = str:gsub("%s+$", "")
@@ -5564,12 +5565,16 @@ function Fatality.new(Window: Window)
 
 
 	function Fatal:LoadConfig(config)
+        print("real load config")
 		for i, v in next, config do
+            print(i,v)
 			if i ~= "Info" then
 				local Element = Fatality.WindowFlags[Fatalitywin][i]
+                print("ELEMENT - ",Element)
 
 				if Element then
 					local Value = v.Value
+                    print("VALUE - ",Value)
 
 					task.spawn(function()
 						if Value.Type == "String" then
@@ -5586,8 +5591,9 @@ function Fatality.new(Window: Window)
 							Element:SetValue(Value.Value)
 
 						elseif Value.Type == "Color3" then
+                            print("got color 3")
 							Element:SetValue(
-                                _, -- tut
+                                --_,  tut
 								Color3.new(Value.Value.R, Value.Value.G, Value.Value.B),
 								Value.Value.Transparency
 							)
