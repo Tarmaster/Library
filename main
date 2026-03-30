@@ -5561,6 +5561,8 @@ function Fatality.new(Window: Window)
 		return self.ConfigManager;
 	end;
 
+
+
 	function Fatal:LoadConfig(config)
 		for i, v in next, config do
 			if i ~= "Info" then
@@ -5585,6 +5587,7 @@ function Fatality.new(Window: Window)
 
 						elseif Value.Type == "Color3" then
 							Element:SetValue(
+                                _, -- tut
 								Color3.new(Value.Value.R, Value.Value.G, Value.Value.B),
 								Value.Value.Transparency
 							)
