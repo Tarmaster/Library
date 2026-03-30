@@ -3381,7 +3381,7 @@ function Fatality:CreateElements(Parent : Frame , ZIndex : number , Event : Bind
 			SetValue = function(rgb,opc)
                 print("rgb set value")
 				local IsSame = ValueFrame.BackgroundColor3 == rgb or ValueFrame.BackgroundTransparency == opc;
-                print("SAME",IsSame)
+                print("SAME",IsSame,ValueFrame.BackgroundColor3 == rgb,ValueFrame.BackgroundTransparency == opc) -- ТУТ. ПРИ ОБЫЧНОЙ СМЕНЕ ВСЕ НОРМ
 				ValueFrame.BackgroundColor3 = rgb; 
 				ValueFrame.BackgroundTransparency = opc;
 				res.set_opc(opc);
