@@ -348,7 +348,7 @@ end
 -- Подписка UI-объекта на токен темы (live update)
 function Fatality:BindTheme(Fatal, inst: Instance, prop: string, token: string)
     print("BIND THEME",fatal,inst,prop,token)
-    
+
 	if not Fatal or not inst then return end
 	Fatal.__themeBinds = Fatal.__themeBinds or {}
 	Fatal.__themeBinds[inst] = Fatal.__themeBinds[inst] or {}
@@ -4950,6 +4950,7 @@ function Fatality.new(Window: Window)
 	Fatal.BottomHeight = bottomHeight
 	
 	function Fatal:SetTheme(partialTheme: table)
+        print("Set theme : fired")
 		if typeof(partialTheme) ~= "table" then return end
 		deepMerge(self.Theme, partialTheme)
 		self.ThemeChanged:Fire(self.Theme)
