@@ -346,7 +346,7 @@ end
 
 -- Подписка UI-объекта на токен темы (live update)
 function Fatality:BindTheme(Fatal, inst: Instance, prop: string, token: string)
-    print("BIND THEME",fatal,inst,prop,token)
+    --print("BIND THEME",fatal,inst,prop,token)
 
 	if not Fatal or not inst then return end
 	Fatal.__themeBinds = Fatal.__themeBinds or {}
@@ -3378,9 +3378,7 @@ function Fatality:CreateElements(Parent : Frame , ZIndex : number , Event : Bind
 			end,
 			Signal = Event.Event:Connect(OpcToggle),
 			SetValue = function(rgb,opc)
-                print("rgb set value")
 				local IsSame = ValueFrame.BackgroundColor3 == rgb --or ValueFrame.BackgroundTransparency == opc;
-                print("SAME 2",IsSame,ValueFrame.BackgroundColor3 == rgb) -- ТУТ. ПРИ ОБЫЧНОЙ СМЕНЕ ВСЕ НОРМ
 				ValueFrame.BackgroundColor3 = rgb; 
 				ValueFrame.BackgroundTransparency = opc;
 				res.set_opc(opc);
@@ -4543,7 +4541,6 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		SanitizeToken = function(str)
-           -- print("sanitize",str)
 			str = tostring(str or "Fatality")
 			str = str:gsub("^%s+", "")
 			str = str:gsub("%s+$", "")
