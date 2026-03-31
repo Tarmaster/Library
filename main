@@ -1,5 +1,5 @@
 -- Export Types --
-print("lib v5")
+print("lib v6")
 export type Window = {
 	Name: string,
 	Keybind: string | Enum.KeyCode | {string | Enum.KeyCode},
@@ -4639,7 +4639,11 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 				local button = new_button();
 
 				button.Parent = ScrollingFrame;
-				button.Text = " "..tostring(v);
+				button.Text = " "..tostring(v); --ddd
+
+                print("binded",i,v)
+                Fatality:BindTheme(Fatal, button, "TextColor3", "ConfigPicked")
+                
 
 				if tostring(import.Name) == tostring(v) or import.Name == v then
 					import.Element = button;
