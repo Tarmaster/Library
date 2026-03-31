@@ -1,5 +1,5 @@
 -- Export Types --
-print("lib v2")
+print("lib v4")
 export type Window = {
 	Name: string,
 	Keybind: string | Enum.KeyCode | {string | Enum.KeyCode},
@@ -3386,9 +3386,9 @@ function Fatality:CreateElements(Parent : Frame , ZIndex : number , Event : Bind
 				ValueFrame.BackgroundTransparency = opc;
 				res.set_opc(opc);
 
-				if not IsSame then
-					task.spawn(Config.Callback,rgb,opc)
-				end;
+				--if not IsSame then
+				task.spawn(Config.Callback,rgb,opc)
+				--end;
 			end,
 			GetValue = function()
 				return {
