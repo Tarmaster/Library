@@ -1,5 +1,4 @@
 -- Export Types --
-print("lib v6")
 export type Window = {
 	Name: string,
 	Keybind: string | Enum.KeyCode | {string | Enum.KeyCode},
@@ -4628,7 +4627,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		Refresh = function()
-            print("Refresh")
+            --print("Refresh")
 			for i,v in next , ScrollingFrame:GetChildren() do
 				if v:IsA('TextButton') then
 					v:Destroy();
@@ -4641,7 +4640,6 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 				button.Parent = ScrollingFrame;
 				button.Text = " "..tostring(v); --ddd
 
-                print("binded",i,v)
                 Fatality:BindTheme(Fatal, button, "TextColor3", "ConfigPicked")
                 
 
@@ -4747,7 +4745,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 		end,
 
 		LoadConfig = function(name)
-            print("2 LOAD CONFIG ",name,res:NormalizeConfigName(name))
+            --print("LOAD CONFIG ",name,res:NormalizeConfigName(name))
 			name = res:NormalizeConfigName(name)
 			if name == "" then return end
 
@@ -4757,7 +4755,7 @@ function Fatality:CreateConfigWindow(Root: ScreenGui , Fatal , Button: ImageButt
 			end
 
 			local path = res:GetConfigFilePath(name)
-            print("path",path)
+            --print("path",path)
 			if not res:SafeIsFile(path) then
 				warn("[Fatality Config] config file not found:", path)
 				return
@@ -4956,7 +4954,7 @@ function Fatality.new(Window: Window)
 	Fatal.BottomHeight = bottomHeight
 	
 	function Fatal:SetTheme(partialTheme: table)
-        print("Set theme : fired")
+        --print("Set theme : fired")
 		if typeof(partialTheme) ~= "table" then return end
 		deepMerge(self.Theme, partialTheme)
 		self.ThemeChanged:Fire(self.Theme)
@@ -5570,16 +5568,13 @@ function Fatality.new(Window: Window)
 
 
 	function Fatal:LoadConfig(config)
-        print("real load config")
+        --print("r load config")
 		for i, v in next, config do
-            print(i,v)
 			if i ~= "Info" then
 				local Element = Fatality.WindowFlags[Fatalitywin][i]
-                print("ELEMENT - ",Element)
 
 				if Element then
 					local Value = v.Value
-                    print("VALUE - ",Value)
 
 					task.spawn(function()
 						if Value.Type == "String" then
@@ -5596,9 +5591,7 @@ function Fatality.new(Window: Window)
 							Element:SetValue(Value.Value)
 
 						elseif Value.Type == "Color3" then
-                            print("got color 3")
 							Element:SetValue(
-                                --_,  tut
 								Color3.new(Value.Value.R, Value.Value.G, Value.Value.B),
 								Value.Value.Transparency
 							)
