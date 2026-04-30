@@ -130,7 +130,8 @@ export type Notify = {
 	Content: string,
 	Duration: number,
 	Flag: string | nil,
-	Icon: string
+	Icon: string,
+	Callback: (() -> any)?
 }
 
 export type Notifier = {
@@ -7603,7 +7604,7 @@ function Fatality:CreateNotifier(): Notifier
 
 			notify.Name = Fatality:RandomString()
 			notify.Parent = layout
-			notify.BackgroundColor3 = Color3.fromRGB(19, 19, 19)
+			notify.BackgroundColor3 = Color3.fromRGB(255, 0, 0)--Color3.fromRGB(19, 19, 19)
 			notify.BackgroundTransparency = 1.000
 			notify.BorderColor3 = Color3.fromRGB(0, 0, 0)
 			notify.BorderSizePixel = 0
@@ -7612,7 +7613,7 @@ function Fatality:CreateNotifier(): Notifier
 			notify_block.Name = Fatality:RandomString()
 			notify_block.Parent = notify
 			notify_block.AnchorPoint = Vector2.new(0.5, 0)
-			notify_block.BackgroundColor3 = Color3.fromRGB(19, 19, 19)
+			notify_block.BackgroundColor3 = Color3.fromRGB(0, 255, 0)--Color3.fromRGB(19, 19, 19)
 			notify_block.BackgroundTransparency = 1
 			notify_block.BorderColor3 = Color3.fromRGB(0, 0, 0)
 			notify_block.BorderSizePixel = 0
