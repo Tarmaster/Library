@@ -1,4 +1,4 @@
-print("lib dis2")
+print("lib dis3")
 -- Export Types --
 export type Window = {
 	Name: string,
@@ -7695,7 +7695,7 @@ function Fatality:CreateNotifier(): Notifier
 			if Config.Callback and typeof(Config.Callback) == "function" then
 
 				conn = notify_block.InputBegan:Connect(function(input)
-					if input.UserInputType = Enum.UserInputType.MouseButton1 then
+					if input.UserInputType == Enum.UserInputType.MouseButton1 then
 						Config.Callback()
 					end
 				end)
