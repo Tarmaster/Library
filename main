@@ -1,4 +1,4 @@
-print("lib dis")
+print("lib dis2")
 -- Export Types --
 export type Window = {
 	Name: string,
@@ -7601,10 +7601,11 @@ function Fatality:CreateNotifier(): Notifier
 			local Icon = Instance.new("ImageLabel")
 			local HeaderText = Instance.new("TextLabel")
 			local BodyText = Instance.new("TextLabel")
+			local conn = nil
 
 			notify.Name = Fatality:RandomString()
 			notify.Parent = layout
-			notify.BackgroundColor3 = Color3.fromRGB(255, 0, 0)--Color3.fromRGB(19, 19, 19)
+			notify.BackgroundColor3 = Color3.fromRGB(19, 19, 19)
 			notify.BackgroundTransparency = 1.000
 			notify.BorderColor3 = Color3.fromRGB(0, 0, 0)
 			notify.BorderSizePixel = 0
@@ -7613,7 +7614,7 @@ function Fatality:CreateNotifier(): Notifier
 			notify_block.Name = Fatality:RandomString()
 			notify_block.Parent = notify
 			notify_block.AnchorPoint = Vector2.new(0.5, 0)
-			notify_block.BackgroundColor3 = Color3.fromRGB(0, 255, 0)--Color3.fromRGB(19, 19, 19)
+			notify_block.BackgroundColor3 = Color3.fromRGB(19, 19, 19)
 			notify_block.BackgroundTransparency = 1
 			notify_block.BorderColor3 = Color3.fromRGB(0, 0, 0)
 			notify_block.BorderSizePixel = 0
@@ -7691,6 +7692,16 @@ function Fatality:CreateNotifier(): Notifier
 				});
 			end;
 
+			if Config.Callback and typeof(Config.Callback) == "function" then
+
+				conn = notify_block.InputBegan:Connect(function(input)
+					if input.UserInputType = Enum.UserInputType.MouseButton1 then
+						Config.Callback()
+					end
+				end)
+
+			end
+
 			task.delay(0.1,function()
 				Fatality:CreateAnimation(notify_block,0.25,{
 					BackgroundTransparency = 0.1
@@ -7748,10 +7759,12 @@ function Fatality:CreateNotifier(): Notifier
 					})
 
 					task.wait(0.5)
-
+					conn:Disconnect()
 					notify:Destroy();
 				end);
 			end)
+
+
 		end,
 	});
 
