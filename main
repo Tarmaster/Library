@@ -1,4 +1,4 @@
-print("lib dis3")
+print("lib dis4")
 -- Export Types --
 export type Window = {
 	Name: string,
@@ -7632,14 +7632,14 @@ function Fatality:CreateNotifier(): Notifier
 
 			Icon.Name = Fatality:RandomString()
 			Icon.Parent = notify_block
-			Icon.BackgroundColor3 = Fatality.Colors.Main
+			Icon.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 			Icon.BackgroundTransparency = 1.000
 			Icon.BorderColor3 = Color3.fromRGB(0, 0, 0)
 			Icon.BorderSizePixel = 0
 			Icon.Position = UDim2.new(0, 7, 0, 7)
 			Icon.Size = UDim2.new(0, 18, 0, 18)
 			Icon.Image = Fatality:GetIcon(Config.Icon);
-			Icon.ImageColor3 = Fatality.Colors.Main
+			Icon.ImageColor3 = Color3.fromRGB(255, 255, 255)
 			Icon.ImageTransparency = 1
 			Icon.ZIndex = 55
 
@@ -7654,7 +7654,7 @@ function Fatality:CreateNotifier(): Notifier
 			HeaderText.ZIndex = 55
 			HeaderText.FontFace = Fatality.FontSemiBold
 			HeaderText.Text = Config.Title
-			HeaderText.TextColor3 = Fatality.Colors.Main
+			HeaderText.TextColor3 = Color3.fromRGB(255, 255, 255)
 			HeaderText.TextSize = 13.000
 			HeaderText.TextTransparency = 1
 			HeaderText.TextXAlignment = Enum.TextXAlignment.Left
