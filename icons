@@ -1,6 +1,6 @@
 -- Add your uploaded Roblox image assets here.
 -- Example: ["00Circle"] = "rbxassetid://1234567890",
-getgenv().Icons = {
+return {
   ["00Circle"] = "rbxassetid://83028270380365",
   ["00CircleFill"] = "rbxassetid://86809068648199",
   ["00Square"] = "rbxassetid://122749670129495",
