@@ -1,5 +1,5 @@
 --[[
-    Obsidian UI
+    Averlik UI
     A standalone retained-mode UI library for Luau / Roblox clients.
 
     Quick start:
@@ -10,12 +10,13 @@
         Section:AddToggle({ Name = "Enabled", Default = true, Callback = print })
 
     Executor runtime support is intentionally limited to selecting a GUI host
-    through the UNC-compatible gethui() API when it is available. The library
-    contains no hooks, input simulation, game automation, networking, or file I/O.
+    through the UNC-compatible gethui() API and persistent UI configurations
+    through the UNC filesystem API. The library contains no hooks, input
+    simulation, game automation, networking, or other executor features.
 ]]
 
 local Library = {
-    Version = "1.2.0",
+    Version = "1.5.0",
     Windows = {},
     Icons = {},
     _lastWindow = nil,
@@ -23,7 +24,9 @@ local Library = {
 
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
 
 local function isPointerInput(input)
     return input.UserInputType == Enum.UserInputType.MouseButton1
@@ -85,6 +88,9 @@ Section.__index = Section
 
 local Control = {}
 Control.__index = Control
+
+local Configurations = {}
+Configurations.__index = Configurations
 
 -- Keeps executor-specific behavior at the edge of the library. The UI itself
 -- only receives a normal Instance parent and remains usable in PlayerGui.
@@ -158,7 +164,68 @@ local Theme = {
     SubtleText = Color3.fromRGB(105, 105, 108),
     Accent = Color3.fromRGB(112, 210, 76),
     Shadow = Color3.fromRGB(0, 0, 0),
+    SidebarTop = Color3.fromRGB(10, 10, 11),
+    SidebarBottom = Color3.fromRGB(10, 10, 11),
+    CloseButton = Color3.fromRGB(25, 25, 26),
+    Search = Color3.fromRGB(20, 20, 21),
+    DropdownOption = Color3.fromRGB(20, 20, 21),
+    SectionTitle = Color3.fromRGB(241, 241, 242),
 }
+
+-- The exit transition is intentionally shorter, so repeated GUI toggles feel
+-- responsive while the first entrance can stay more deliberate.
+local WINDOW_TRANSITION_DURATION = 0.26
+local WINDOW_CLOSE_DURATION = 0.10
+local WINDOW_UNLOAD_DURATION = 0.52
+local WINDOW_VISIBLE_TRANSPARENCY = 0.05
+local WINDOW_HIDDEN_TRANSPARENCY = 1
+local WINDOW_SHADOW_TRANSPARENCY = 0.72
+local CONTENT_EXIT_DURATION = 0.09
+local CONTENT_EXIT_STAGGER = 0.01
+
+local LanguageAliases = {
+    en = "en",
+    english = "en",
+    ["английский"] = "en",
+    ru = "ru",
+    russian = "ru",
+    ["русский"] = "ru",
+}
+
+-- Text passed to the public API can be either a normal string or a pair in
+-- the form { "English", "Русский" }. Keeping strings valid makes the new
+-- localisation system non-breaking for existing interfaces.
+local function normalizeLanguage(language)
+    if type(language) ~= "string" then
+        return nil
+    end
+    return LanguageAliases[string.lower(language)]
+end
+
+local function localizedText(value, language)
+    if type(value) == "table" then
+        local index = language == "ru" and 2 or 1
+        local translation = value[index]
+        if translation == nil then
+            translation = value[1] or value[2]
+        end
+        return tostring(translation or "")
+    end
+    if value == nil then
+        return ""
+    end
+    return tostring(value)
+end
+
+local function localizedValuesEqual(left, right)
+    if left == right then
+        return true
+    end
+    if type(left) == "table" and type(right) == "table" then
+        return left[1] == right[1] and left[2] == right[2]
+    end
+    return false
+end
 
 local function cloneTable(source)
     local result = {}
@@ -181,13 +248,72 @@ local function mergeTheme(accent, overrides)
     return theme
 end
 
-local function tween(instance, duration, properties, style, direction)
+local function resolveKeyCode(value)
+    if type(value) == "string" then
+        return Enum.KeyCode[value]
+    end
+    if typeof(value) == "EnumItem" and value.EnumType == Enum.KeyCode then
+        return value
+    end
+    return nil
+end
+
+-- A proxy keeps Window.Theme convenient to read while ensuring direct writes
+-- such as Window.Theme.Accent = Color3.fromRGB(...) update the live UI too.
+local function createThemeProxy(window, values)
+    return setmetatable({}, {
+        __index = values,
+        __newindex = function(_, key, value)
+            window:SetThemeColor(key, value)
+        end,
+        __pairs = function()
+            return next, values, nil
+        end,
+    })
+end
+
+local activeTweens = setmetatable({}, { __mode = "k" })
+
+local function tween(instance, duration, properties, style, direction, delayTime)
+    local activeProperties = activeTweens[instance]
+    if not activeProperties then
+        activeProperties = {}
+        activeTweens[instance] = activeProperties
+    end
+    for property in pairs(properties) do
+        local previous = activeProperties[property]
+        if previous then
+            local state = previous.PlaybackState
+            if state == Enum.PlaybackState.Playing or state == Enum.PlaybackState.Delayed then
+                previous:Cancel()
+            end
+        end
+    end
     local info = TweenInfo.new(
         duration or 0.16,
         style or Enum.EasingStyle.Quad,
-        direction or Enum.EasingDirection.Out
+        direction or Enum.EasingDirection.Out,
+        0,
+        false,
+        delayTime or 0
     )
     local animation = TweenService:Create(instance, info, properties)
+    -- Cancel() can synchronously fire Completed and clear the weak-table entry.
+    -- Reattach this property map before registering the replacement tween.
+    activeTweens[instance] = activeProperties
+    for property in pairs(properties) do
+        activeProperties[property] = animation
+    end
+    animation.Completed:Connect(function()
+        for property in pairs(properties) do
+            if activeProperties[property] == animation then
+                activeProperties[property] = nil
+            end
+        end
+        if next(activeProperties) == nil then
+            activeTweens[instance] = nil
+        end
+    end)
     animation:Play()
     return animation
 end
@@ -229,6 +355,54 @@ local function uiShadow(parent, color, transparency, blurRadius, offset, spread)
     })
 end
 
+-- These colours belong to a control's value or to its colour-selection UI,
+-- rather than the window theme. Theme replacement must leave them untouched.
+local function preserveControlColor(instance)
+    instance:SetAttribute("AverlikPreserveColor", true)
+    return instance
+end
+
+local function compositeTransparency(baseTransparency, groupTransparency)
+    return 1 - (1 - baseTransparency) * (1 - groupTransparency)
+end
+
+local function formatSessionDuration(seconds)
+    seconds = math.max(0, math.floor(seconds))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor(seconds % 3600 / 60)
+    local remainingSeconds = seconds % 60
+
+    if hours > 0 then
+        return string.format("%d:%02d:%02d", hours, minutes, remainingSeconds)
+    end
+    return string.format("%d:%02d", minutes, remainingSeconds)
+end
+
+local ThemeColorProperties = {
+    "BackgroundColor3",
+    "TextColor3",
+    "PlaceholderColor3",
+    "ImageColor3",
+    "ScrollBarImageColor3",
+    "Color",
+}
+
+local function bindThemeColor(instance, property, themeKey)
+    instance:SetAttribute("AverlikTheme_" .. property, themeKey)
+    return instance
+end
+
+-- Public positions describe the centre of a window. The window itself is
+-- top-left anchored so resizing never repositions its rendered CanvasGroup.
+local function centeredWindowPosition(position, size)
+    return UDim2.new(
+        position.X.Scale - size.X.Scale / 2,
+        position.X.Offset - size.X.Offset / 2,
+        position.Y.Scale - size.Y.Scale / 2,
+        position.Y.Offset - size.Y.Offset / 2
+    )
+end
+
 local function padding(parent, left, right, top, bottom)
     return new("UIPadding", {
         PaddingLeft = UDim.new(0, left or 0),
@@ -252,6 +426,7 @@ end
 
 local function text(parent, properties)
     properties = properties or {}
+    local usesThemeText = properties.TextColor3 == nil
     properties.BackgroundTransparency = 1
     properties.BorderSizePixel = 0
     properties.Font = properties.Font or Enum.Font.Gotham
@@ -260,11 +435,16 @@ local function text(parent, properties)
     properties.TextXAlignment = properties.TextXAlignment or Enum.TextXAlignment.Left
     properties.TextYAlignment = properties.TextYAlignment or Enum.TextYAlignment.Center
     properties.Parent = parent
-    return new("TextLabel", properties)
+    local label = new("TextLabel", properties)
+    if usesThemeText then
+        bindThemeColor(label, "TextColor3", "Text")
+    end
+    return label
 end
 
 local function button(parent, properties)
     properties = properties or {}
+    local usesThemeText = properties.TextColor3 == nil
     properties.AutoButtonColor = false
     properties.BorderSizePixel = 0
     properties.Font = properties.Font or Enum.Font.Gotham
@@ -272,7 +452,11 @@ local function button(parent, properties)
     properties.TextSize = properties.TextSize or 12
     properties.TextXAlignment = properties.TextXAlignment or Enum.TextXAlignment.Left
     properties.Parent = parent
-    return new("TextButton", properties)
+    local control = new("TextButton", properties)
+    if usesThemeText then
+        bindThemeColor(control, "TextColor3", "Text")
+    end
+    return control
 end
 
 local function safeCall(callback, ...)
@@ -285,7 +469,7 @@ local function safeCall(callback, ...)
             callback(table.unpack(args, 1, args.n))
         end)
         if not ok then
-            warn("[Obsidian UI] callback error: " .. tostring(err))
+            warn("[Averlik UI] callback error: " .. tostring(err))
         end
     end)
 end
@@ -315,6 +499,227 @@ local function getGuiParent(preferredParent, useExecutorGui)
     return Runtime:ResolveParent(preferredParent, useExecutorGui)
 end
 
+local DEFAULT_CONFIG_FOLDER = "Averlik/Configs"
+local DEFAULT_CONFIG_EXTENSION = ".json"
+local CONFIG_TYPE_KEY = "__averlikType"
+
+local function trimString(value)
+    return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
+end
+
+local function getFilesystemFunction(name)
+    local candidate = rawget(_G, name)
+    if type(candidate) ~= "function" and type(getfenv) == "function" then
+        local environment = getfenv()
+        if type(environment) == "table" then
+            candidate = environment[name]
+        end
+    end
+    if type(candidate) ~= "function" and type(getgenv) == "function" then
+        local ok, environment = pcall(getgenv)
+        if ok and type(environment) == "table" then
+            candidate = environment[name]
+        end
+    end
+    return type(candidate) == "function" and candidate or nil
+end
+
+local function requireFilesystemFunctions(...)
+    local missing = {}
+    for index = 1, select("#", ...) do
+        local name = select(index, ...)
+        if not getFilesystemFunction(name) then
+            table.insert(missing, name)
+        end
+    end
+    if #missing > 0 then
+        return false, "Executor filesystem API is unavailable: " .. table.concat(missing, ", ")
+    end
+    return true
+end
+
+local function callFilesystem(name, ...)
+    local operation = getFilesystemFunction(name)
+    if not operation then
+        return false, "Executor filesystem API is unavailable: " .. name
+    end
+    local result = table.pack(pcall(operation, ...))
+    if not result[1] then
+        return false, tostring(result[2])
+    end
+    return true, result[2]
+end
+
+local function normalizeConfigFolder(folder)
+    folder = trimString(folder == nil and DEFAULT_CONFIG_FOLDER or folder)
+    folder = string.gsub(folder, "\\", "/")
+    folder = string.gsub(folder, "^/+", "")
+    folder = string.gsub(folder, "/+$", "")
+    if folder == "" then
+        return nil, "ConfigFolder cannot be empty"
+    end
+
+    local parts = {}
+    for part in string.gmatch(folder, "[^/]+") do
+        if part == "." or part == ".." or string.find(part, "[%c<>:\"|?*]") then
+            return nil, "ConfigFolder contains an invalid path component"
+        end
+        table.insert(parts, part)
+    end
+    if #parts == 0 then
+        return nil, "ConfigFolder cannot be empty"
+    end
+    return table.concat(parts, "/")
+end
+
+local function normalizeConfigExtension(extension)
+    extension = trimString(extension == nil and DEFAULT_CONFIG_EXTENSION or extension)
+    if extension == "" then
+        return nil, "ConfigExtension cannot be empty"
+    end
+    if string.sub(extension, 1, 1) ~= "." then
+        extension = "." .. extension
+    end
+    if string.find(extension, "[%c\\/:*?\"<>|]") then
+        return nil, "ConfigExtension contains invalid characters"
+    end
+    return extension
+end
+
+local function normalizeConfigName(name, extension)
+    if type(name) ~= "string" and type(name) ~= "number" then
+        return nil, "Config name must be a string"
+    end
+    name = trimString(name)
+    if string.sub(name, -#extension) == extension then
+        name = string.sub(name, 1, #name - #extension)
+        name = trimString(name)
+    end
+    if name == "" then
+        return nil, "Config name cannot be empty"
+    end
+    if #name > 80 then
+        return nil, "Config name is too long (maximum: 80 characters)"
+    end
+    if name == "." or name == ".." or string.find(name, "[%c\\/:*?\"<>|]") then
+        return nil, "Config name contains invalid characters"
+    end
+    return name
+end
+
+local function ensureConfigFolder(folder)
+    local available, availabilityError = requireFilesystemFunctions("isfolder", "makefolder")
+    if not available then
+        return false, availabilityError
+    end
+
+    local path = ""
+    for part in string.gmatch(folder, "[^/]+") do
+        path = path == "" and part or path .. "/" .. part
+        local checked, exists = callFilesystem("isfolder", path)
+        if not checked then
+            return false, "Unable to inspect config folder: " .. tostring(exists)
+        end
+        if not exists then
+            local created, createError = callFilesystem("makefolder", path)
+            if not created then
+                return false, "Unable to create config folder: " .. tostring(createError)
+            end
+        end
+    end
+    return true
+end
+
+local function serializeConfigValue(value, seen)
+    local valueType = typeof(value)
+    if valueType == "Color3" then
+        return {
+            [CONFIG_TYPE_KEY] = "Color3",
+            R = value.R,
+            G = value.G,
+            B = value.B,
+        }
+    end
+    if valueType == "EnumItem" then
+        -- Enum.KeyCode is an Enum, not an Instance, so it has no Name
+        -- property. Keybinds are the supported EnumItem control value.
+        local enumTypeName = value.EnumType == Enum.KeyCode and "KeyCode"
+            or string.match(tostring(value.EnumType), "^Enum%.(.+)$")
+            or tostring(value.EnumType)
+        if type(enumTypeName) ~= "string" or not Enum[enumTypeName] then
+            return nil, "invalid enum type"
+        end
+        return {
+            [CONFIG_TYPE_KEY] = "EnumItem",
+            EnumType = enumTypeName,
+            Name = value.Name,
+        }
+    end
+    if type(value) == "string" or type(value) == "number" or type(value) == "boolean" then
+        return value
+    end
+    if type(value) ~= "table" then
+        return nil, "unsupported value type " .. valueType
+    end
+
+    seen = seen or {}
+    if seen[value] then
+        return nil, "cyclic tables cannot be stored"
+    end
+    seen[value] = true
+
+    local result = {}
+    for key, child in pairs(value) do
+        if type(key) ~= "string" and type(key) ~= "number" then
+            seen[value] = nil
+            return nil, "table keys must be strings or numbers"
+        end
+        local serialized, serializeError = serializeConfigValue(child, seen)
+        if serialized == nil then
+            seen[value] = nil
+            return nil, serializeError
+        end
+        result[key] = serialized
+    end
+    seen[value] = nil
+    return result
+end
+
+local function deserializeConfigValue(value)
+    if type(value) ~= "table" then
+        return value
+    end
+    local valueType = value[CONFIG_TYPE_KEY]
+    if valueType == "Color3" then
+        if type(value.R) ~= "number" or type(value.G) ~= "number" or type(value.B) ~= "number" then
+            return nil, "invalid Color3 value"
+        end
+        return Color3.new(
+            math.clamp(value.R, 0, 1),
+            math.clamp(value.G, 0, 1),
+            math.clamp(value.B, 0, 1)
+        )
+    end
+    if valueType == "EnumItem" then
+        local enumType = type(value.EnumType) == "string" and Enum[value.EnumType] or nil
+        local enumItem = enumType and type(value.Name) == "string" and enumType[value.Name] or nil
+        if not enumItem then
+            return nil, "invalid enum value"
+        end
+        return enumItem
+    end
+
+    local result = {}
+    for key, child in pairs(value) do
+        local decoded, decodeError = deserializeConfigValue(child)
+        if decoded == nil and decodeError then
+            return nil, decodeError
+        end
+        result[key] = decoded
+    end
+    return result
+end
+
 local function makeSwitch(parent, theme, value)
     local track = new("Frame", {
         Name = "Switch",
@@ -339,6 +744,7 @@ local function makeSwitch(parent, theme, value)
     local function set(state, instant)
         local position = UDim2.new(0, state and 21 or 3, 0.5, -7)
         local color = state and theme.Accent or Color3.fromRGB(51, 51, 53)
+        glow.Color = theme.Accent
         if instant then
             knob.Position = position
             track.BackgroundColor3 = color
@@ -354,16 +760,52 @@ local function makeSwitch(parent, theme, value)
 end
 
 local function addHover(target, theme, normal, hovered)
+    local isHovered = false
+    local function resolve(color)
+        if type(color) == "function" then
+            return color(theme)
+        end
+        return color or theme.SurfaceHover
+    end
+    local function apply(duration)
+        tween(target, duration or 0.12, {
+            BackgroundColor3 = resolve(isHovered and hovered or normal),
+        })
+    end
     target.MouseEnter:Connect(function()
-        tween(target, 0.12, { BackgroundColor3 = hovered or theme.SurfaceHover })
+        isHovered = true
+        apply()
     end)
     target.MouseLeave:Connect(function()
-        tween(target, 0.12, { BackgroundColor3 = normal })
+        isHovered = false
+        apply()
     end)
+    return function()
+        apply(0)
+    end
+end
+
+local CyrillicLowercase = {
+    ["А"] = "а", ["Б"] = "б", ["В"] = "в", ["Г"] = "г", ["Д"] = "д", ["Е"] = "е",
+    ["Ё"] = "ё", ["Ж"] = "ж", ["З"] = "з", ["И"] = "и", ["Й"] = "й", ["К"] = "к",
+    ["Л"] = "л", ["М"] = "м", ["Н"] = "н", ["О"] = "о", ["П"] = "п", ["Р"] = "р",
+    ["С"] = "с", ["Т"] = "т", ["У"] = "у", ["Ф"] = "ф", ["Х"] = "х", ["Ц"] = "ц",
+    ["Ч"] = "ч", ["Ш"] = "ш", ["Щ"] = "щ", ["Ъ"] = "ъ", ["Ы"] = "ы", ["Ь"] = "ь",
+    ["Э"] = "э", ["Ю"] = "ю", ["Я"] = "я",
+}
+
+-- Luau's string.lower handles Latin letters, but not Cyrillic. Search has to
+-- fold Russian uppercase characters explicitly so "Язык" and "язык" match.
+local function searchLower(value)
+    value = tostring(value or "")
+    for uppercase, lowercase in pairs(CyrillicLowercase) do
+        value = string.gsub(value, uppercase, lowercase)
+    end
+    return string.lower(value)
 end
 
 local function componentSearchText(name, description)
-    return string.lower(tostring(name or "") .. " " .. tostring(description or ""))
+    return searchLower(tostring(name or "") .. " " .. tostring(description or ""))
 end
 
 function Control:_track(connection)
@@ -398,7 +840,8 @@ function Control:SetCallback(callback)
 end
 
 function Control:SetTitle(value)
-    self.Name = tostring(value or "")
+    self._nameSource = value
+    self.Name = self.Section.Window:_resolveLocalizedText(value)
     if self._titleLabel then
         self._titleLabel.Text = self.Name
     end
@@ -407,13 +850,30 @@ function Control:SetTitle(value)
 end
 
 function Control:SetDescription(value)
-    self.Description = tostring(value or "")
+    self._descriptionSource = value
+    self.Description = self.Section.Window:_resolveLocalizedText(value)
     if self._descriptionLabel then
         self._descriptionLabel.Text = self.Description
         self._descriptionLabel.Visible = self.Description ~= ""
     end
     self._searchText = componentSearchText(self.Name, self.Description)
     return self
+end
+
+function Control:_refreshLocalization()
+    self.Name = self.Section.Window:_resolveLocalizedText(self._nameSource)
+    self.Description = self.Section.Window:_resolveLocalizedText(self._descriptionSource)
+    if self._titleLabel then
+        self._titleLabel.Text = self.Name
+    end
+    if self._descriptionLabel then
+        self._descriptionLabel.Text = self.Description
+        self._descriptionLabel.Visible = self.Description ~= ""
+    end
+    if self._refreshLocalizedText then
+        self._refreshLocalizedText()
+    end
+    self._searchText = componentSearchText(self.Name, self.Description)
 end
 
 function Control:SetVisible(visible)
@@ -449,19 +909,55 @@ function Control:Destroy()
     end
 end
 
-function Section:_newControl(name, description, frame)
+function Control:SetSaveConfig(enabled)
+    self.SaveConfig = enabled ~= false
+    self.Save = self.SaveConfig
+    return self
+end
+
+function Window:_registerConfigControl(control, options)
+    options = options or {}
+    control.SaveConfig = options.SaveConfig ~= false and options.Save ~= false
+    control.Save = control.SaveConfig
+    local flag = options.Flag
+    if flag == nil then
+        flag = options.ConfigFlag
+    end
+    if flag == nil then
+        return control
+    end
+    assert(type(flag) == "string" and trimString(flag) ~= "", "Config Flag must be a non-empty string")
+    flag = trimString(flag)
+    assert(not self._configControlsByFlag[flag], "Duplicate config Flag: " .. flag)
+
+    control.Flag = flag
+    control.ConfigFlag = flag
+    self._configControlsByFlag[flag] = control
+    table.insert(self._configControls, control)
+    return control
+end
+
+function Section:_newControl(name, description, frame, configOptions)
     local control = setmetatable({
-        Type = name,
-        Name = name,
-        Description = description,
+        Type = self.Window:_resolveLocalizedText(name),
+        Name = self.Window:_resolveLocalizedText(name),
+        Description = self.Window:_resolveLocalizedText(description),
+        _nameSource = name,
+        _descriptionSource = description,
         Section = self,
         Instance = frame,
         Value = nil,
         _callbacks = {},
         _connections = {},
-        _searchText = componentSearchText(name, description),
+        _searchText = componentSearchText(
+            self.Window:_resolveLocalizedText(name),
+            self.Window:_resolveLocalizedText(description)
+        ),
     }, Control)
     table.insert(self.Controls, control)
+    if configOptions then
+        self.Window:_registerConfigControl(control, configOptions)
+    end
     return control
 end
 
@@ -472,14 +968,17 @@ function Section:_row(height)
         Size = UDim2.new(1, 0, 0, height or 48),
         Parent = self.Body,
     })
+    bindThemeColor(frame, "BackgroundColor3", "Surface")
     corner(frame, 10)
     return frame
 end
 
 function Section:AddLabel(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Label"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Label"
+    local descriptionSource = options.Description or ""
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local height = description ~= "" and 48 or 31
     local frame = new("Frame", {
         BackgroundTransparency = 1,
@@ -488,12 +987,13 @@ function Section:AddLabel(options)
     })
     local titleLabel = text(frame, {
         Text = title,
-        Font = Enum.Font.GothamMedium,
+        Font = Enum.Font.GothamBold,
         TextSize = 12,
         Size = UDim2.new(1, -18, 0, 20),
         Position = UDim2.fromOffset(9, description ~= "" and 5 or 5),
         TextColor3 = self.Window.Theme.Text,
     })
+    bindThemeColor(titleLabel, "TextColor3", "Text")
     local descriptionLabel = nil
     if description ~= "" then
         descriptionLabel = text(frame, {
@@ -503,11 +1003,12 @@ function Section:AddLabel(options)
             Size = UDim2.new(1, -18, 0, 16),
             Position = UDim2.fromOffset(9, 25),
         })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
-    local control = self:_newControl(title, description, frame)
+    local control = self:_newControl(titleSource, descriptionSource, frame)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
-    control.Value = title
+    control.Value = control.Name
     function control:SetText(value)
         self:SetTitle(value)
         self.Value = self.Name
@@ -519,8 +1020,10 @@ end
 
 function Section:AddParagraph(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Title or "Paragraph"
-    local content = options.Content or options.Description or ""
+    local titleSource = options.Name or options.Title or "Paragraph"
+    local contentSource = options.Content or options.Description or ""
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local content = self.Window:_resolveLocalizedText(contentSource)
     local frame = self:_row(65)
     local titleLabel = text(frame, {
         Text = title,
@@ -538,14 +1041,14 @@ function Section:AddParagraph(options)
         Size = UDim2.new(1, -20, 0, 32),
         Position = UDim2.fromOffset(10, 27),
     })
-    local control = self:_newControl(title, content, frame)
+    bindThemeColor(body, "TextColor3", "MutedText")
+    local control = self:_newControl(titleSource, contentSource, frame)
     control._titleLabel = titleLabel
     control._descriptionLabel = body
     control.Value = content
     function control:SetContent(value)
-        content = tostring(value)
-        body.Text = content
-        self.Value = content
+        self:SetDescription(value)
+        self.Value = self.Description
         return self
     end
     control.SetValue = control.SetContent
@@ -560,13 +1063,16 @@ function Section:AddDivider()
         Size = UDim2.new(1, 0, 0, 1),
         Parent = self.Body,
     })
+    bindThemeColor(frame, "BackgroundColor3", "Border")
     return self:_newControl("Divider", "", frame)
 end
 
 function Section:AddButton(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Button"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Button"
+    local descriptionSource = options.Description or ""
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local callback = options.Callback or options.Function or options.Pressed
     local frame = self:_row(description ~= "" and 55 or 41)
     frame.BackgroundTransparency = 1
@@ -581,9 +1087,13 @@ function Section:AddButton(options)
         TextColor3 = options.Secondary and self.Window.Theme.Text or Color3.fromRGB(10, 10, 10),
         Parent = frame,
     })
+    if options.Secondary then
+        bindThemeColor(clickable, "BackgroundColor3", "SurfacePressed")
+        bindThemeColor(clickable, "TextColor3", "Text")
+    end
     corner(clickable, 6)
-    local shadow = uiShadow(clickable, clickable.BackgroundColor3, 0.46, 7, UDim2.fromOffset(0, 2), UDim2.fromOffset(1, 1))
-    local control = self:_newControl(title, description, frame)
+    local shadow = uiShadow(clickable, clickable.BackgroundColor3, 0.46, 7, UDim2.fromOffset(0, 0), UDim2.fromOffset(1, 1))
+    local control = self:_newControl(titleSource, descriptionSource, frame)
     control._titleLabel = clickable
     control._callbacks = type(callback) == "function" and { callback } or {}
     local hovered = false
@@ -601,6 +1111,10 @@ function Section:AddButton(options)
     local function restoreColor()
         local normal, hover = getColors()
         applyColor(hovered and hover or normal)
+    end
+    control._refreshTheme = function()
+        local normal, hover, pressed = getColors()
+        applyColor(heldInput and pressed or (hovered and hover or normal), 0)
     end
     control:_track(clickable.MouseEnter:Connect(function()
         hovered = true
@@ -641,22 +1155,35 @@ end
 
 function Section:AddToggle(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Toggle"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Toggle"
+    local descriptionSource = options.Description or ""
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local value = options.Default
     if value == nil then
         value = options.Value or false
     end
     value = value == true
 
-    local frame = self:_row(37)
+    local frame = self:_row(description ~= "" and 55 or 37)
     local titleLabel = text(frame, {
         Text = title,
         Font = Enum.Font.GothamMedium,
         TextSize = 12,
-        Size = UDim2.new(1, -66, 1, 0),
-        Position = UDim2.fromOffset(10, 0),
+        Size = UDim2.new(1, -66, description ~= "" and 0 or 1, description ~= "" and 22 or 0),
+        Position = UDim2.fromOffset(10, description ~= "" and 8 or 0),
     })
+    local descriptionLabel = nil
+    if description ~= "" then
+        descriptionLabel = text(frame, {
+            Text = description,
+            TextSize = 10,
+            TextColor3 = self.Window.Theme.MutedText,
+            Size = UDim2.new(1, -66, 0, 17),
+            Position = UDim2.fromOffset(10, 29),
+        })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
+    end
     local switchHolder = new("Frame", {
         BackgroundTransparency = 1,
         AnchorPoint = Vector2.new(1, 0.5),
@@ -665,11 +1192,14 @@ function Section:AddToggle(options)
         Parent = frame,
     })
     local _, render = makeSwitch(switchHolder, self.Window.Theme, value)
-    local control = self:_newControl(title, description, frame)
+    local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
-    control._descriptionLabel = nil
+    control._descriptionLabel = descriptionLabel
     control.Value = value
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
+    control._refreshTheme = function()
+        render(control.Value, true)
+    end
     function control:SetValue(nextValue, silent)
         nextValue = nextValue == true
         if self.Value == nextValue then
@@ -696,8 +1226,10 @@ end
 
 function Section:AddSlider(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Slider"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Slider"
+    local descriptionSource = options.Description or ""
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local minimum = tonumber(options.Min) or 0
     local maximum = tonumber(options.Max) or 100
     if maximum <= minimum then
@@ -729,6 +1261,7 @@ function Section:AddSlider(options)
         Size = UDim2.fromOffset(58, 18),
         Position = UDim2.new(1, -68, 0, 5),
     })
+    bindThemeColor(valueLabel, "TextColor3", "Text")
     local descriptionLabel = nil
     if description ~= "" then
         descriptionLabel = text(frame, {
@@ -738,6 +1271,7 @@ function Section:AddSlider(options)
             Size = UDim2.new(1, -20, 0, 14),
             Position = UDim2.fromOffset(10, 22),
         })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
     local barY = description ~= "" and 47 or 37
     local track = new("Frame", {
@@ -748,15 +1282,20 @@ function Section:AddSlider(options)
         Parent = frame,
     })
     corner(track, 4)
-    stroke(track, self.Window.Theme.Border, 1, 0.4)
+    bindThemeColor(stroke(track, self.Window.Theme.Border, 1, 0.4), "Color", "Border")
     local fill = new("Frame", {
         BackgroundColor3 = self.Window.Theme.Accent,
         BorderSizePixel = 0,
         Size = UDim2.new(0, 0, 1, 0),
         Parent = track,
     })
+    bindThemeColor(fill, "BackgroundColor3", "Accent")
     corner(fill, 4)
-    uiShadow(fill, self.Window.Theme.Accent, 0.46, 5, UDim2.new(), UDim2.fromOffset(1, 1))
+    bindThemeColor(
+        uiShadow(fill, self.Window.Theme.Accent, 0.46, 5, UDim2.new(), UDim2.fromOffset(1, 1)),
+        "Color",
+        "Accent"
+    )
     local thumb = new("Frame", {
         AnchorPoint = Vector2.new(0.5, 0.5),
         BackgroundColor3 = Color3.fromRGB(244, 244, 245),
@@ -774,7 +1313,7 @@ function Section:AddSlider(options)
         ZIndex = 3,
     })
 
-    local control = self:_newControl(title, description, frame)
+    local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = value
@@ -848,8 +1387,11 @@ end
 
 function Section:AddTextbox(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Textbox"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Textbox"
+    local descriptionSource = options.Description or ""
+    local placeholderSource = options.Placeholder or { "Enter text...", "Введите текст..." }
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local value = tostring(options.Default or options.Value or "")
     local frame = self:_row(description ~= "" and 74 or 59)
     local titleLabel = text(frame, {
@@ -868,6 +1410,7 @@ function Section:AddTextbox(options)
             Size = UDim2.new(1, -20, 0, 15),
             Position = UDim2.fromOffset(10, 23),
         })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
     local inputY = description ~= "" and 43 or 28
     local input = new("TextBox", {
@@ -876,7 +1419,7 @@ function Section:AddTextbox(options)
         ClearTextOnFocus = false,
         Font = Enum.Font.Gotham,
         PlaceholderColor3 = self.Window.Theme.SubtleText,
-        PlaceholderText = options.Placeholder or "Enter text...",
+        PlaceholderText = self.Window:_resolveLocalizedText(placeholderSource),
         Size = UDim2.new(1, -20, 0, 25),
         Position = UDim2.fromOffset(10, inputY),
         Text = value,
@@ -885,14 +1428,20 @@ function Section:AddTextbox(options)
         TextXAlignment = Enum.TextXAlignment.Left,
         Parent = frame,
     })
+    bindThemeColor(input, "PlaceholderColor3", "SubtleText")
+    bindThemeColor(input, "TextColor3", "Text")
     corner(input, 5)
-    stroke(input, self.Window.Theme.Border, 1, 0.48)
+    bindThemeColor(stroke(input, self.Window.Theme.Border, 1, 0.48), "Color", "Border")
     padding(input, 8, 8)
-    local control = self:_newControl(title, description, frame)
+    local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = value
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
+    control._placeholderSource = placeholderSource
+    control._refreshLocalizedText = function()
+        input.PlaceholderText = control.Section.Window:_resolveLocalizedText(control._placeholderSource)
+    end
     function control:SetValue(nextValue, silent)
         nextValue = tostring(nextValue or "")
         self.Value = nextValue
@@ -903,7 +1452,8 @@ function Section:AddTextbox(options)
         return self
     end
     function control:SetPlaceholder(value)
-        input.PlaceholderText = tostring(value or "")
+        self._placeholderSource = value
+        input.PlaceholderText = self.Section.Window:_resolveLocalizedText(value)
         return self
     end
     control:_track(input.Focused:Connect(function()
@@ -926,8 +1476,11 @@ function Section:AddDropdown(options)
     if options.Multi == true then
         return self:AddMultiDropdown(options)
     end
-    local title = options.Name or options.Text or "Dropdown"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Dropdown"
+    local descriptionSource = options.Description or ""
+    local placeholderSource = options.Placeholder or { "Select...", "Выберите..." }
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local values = options.Values or options.Options or {}
     local value = options.Default or options.Value
     if value == nil and #values > 0 then
@@ -952,6 +1505,7 @@ function Section:AddDropdown(options)
             Size = UDim2.new(0.55, 0, 0, 13),
             Position = UDim2.fromOffset(12, 22),
         })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
     local selector = button(frame, {
         BackgroundTransparency = 1,
@@ -960,7 +1514,7 @@ function Section:AddDropdown(options)
         Text = "",
     })
     local selectedText = text(selector, {
-        Text = value and tostring(value) or "Select...",
+        Text = value and self.Window:_resolveLocalizedText(value) or self.Window:_resolveLocalizedText(placeholderSource),
         AnchorPoint = Vector2.new(1, 0.5),
         TextSize = 11,
         TextXAlignment = Enum.TextXAlignment.Right,
@@ -978,6 +1532,7 @@ function Section:AddDropdown(options)
         Size = UDim2.fromOffset(18, 22),
         Position = UDim2.new(1, -10, 0.5, 0),
     })
+    bindThemeColor(arrow, "TextColor3", "MutedText")
     local items = new("Frame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -986,21 +1541,30 @@ function Section:AddDropdown(options)
         Parent = frame,
     })
     listLayout(items, 3)
-    local control = self:_newControl(title, description, frame)
+    local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = value
     control.Values = values
+    control._placeholderSource = placeholderSource
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
     local isOpen = false
     local optionButtons = {}
     local hoveredValue = nil
+    local function findValue(valueToFind)
+        for _, candidate in ipairs(control.Values) do
+            if localizedValuesEqual(candidate, valueToFind) then
+                return candidate
+            end
+        end
+        return nil
+    end
     local function refreshOptionStyles()
         for _, option in ipairs(optionButtons) do
-            local background = Color3.fromRGB(20, 20, 21)
-            if option.Value == control.Value then
+            local background = self.Window.Theme.DropdownOption
+            if localizedValuesEqual(option.Value, control.Value) then
                 background = self.Window.Theme.Selected
-            elseif option.Value == hoveredValue then
+            elseif localizedValuesEqual(option.Value, hoveredValue) then
                 background = self.Window.Theme.SurfaceHover
             end
             tween(option.Button, 0.1, { BackgroundColor3 = background })
@@ -1016,13 +1580,22 @@ function Section:AddDropdown(options)
             refreshOptionStyles()
         end
     end
+    local function refreshSelectedText()
+        selectedText.Text = control.Value and control.Section.Window:_resolveLocalizedText(control.Value)
+            or control.Section.Window:_resolveLocalizedText(control._placeholderSource)
+        selectedText.TextColor3 = control.Value and control.Section.Window.Theme.Text
+            or control.Section.Window.Theme.SubtleText
+    end
+    control._refreshTheme = function()
+        refreshSelectedText()
+        refreshOptionStyles()
+    end
     function control:SetValue(nextValue, silent)
-        self.Value = nextValue
-        selectedText.Text = nextValue and tostring(nextValue) or "Select..."
-        selectedText.TextColor3 = nextValue and self.Section.Window.Theme.Text or self.Section.Window.Theme.SubtleText
+        self.Value = findValue(nextValue) or nextValue
+        refreshSelectedText()
         refreshOptionStyles()
         if not silent then
-            self:_emit(nextValue)
+            self:_emit(self.Value)
         end
         return self
     end
@@ -1035,12 +1608,13 @@ function Section:AddDropdown(options)
         for _, item in ipairs(control.Values) do
             local itemValue = item
             local itemButton = button(items, {
-                BackgroundColor3 = Color3.fromRGB(20, 20, 21),
+                BackgroundColor3 = control.Section.Window.Theme.DropdownOption,
                 Size = UDim2.new(1, 0, 0, 24),
-                Text = tostring(itemValue),
+                Text = control.Section.Window:_resolveLocalizedText(itemValue),
                 TextSize = 10,
                 TextXAlignment = Enum.TextXAlignment.Left,
             })
+            bindThemeColor(itemButton, "BackgroundColor3", "DropdownOption")
             corner(itemButton, 7)
             padding(itemButton, 8, 8)
             table.insert(optionButtons, {
@@ -1062,7 +1636,7 @@ function Section:AddDropdown(options)
                 setOpen(false)
             end))
         end
-        if control.Value ~= nil and not table.find(control.Values, control.Value) then
+        if control.Value ~= nil and not findValue(control.Value) then
             control:SetValue(nil, true)
         end
         if isOpen then
@@ -1070,6 +1644,12 @@ function Section:AddDropdown(options)
         end
         refreshOptionStyles()
         return control
+    end
+    control._refreshLocalizedText = function()
+        refreshSelectedText()
+        for _, option in ipairs(optionButtons) do
+            option.Button.Text = control.Section.Window:_resolveLocalizedText(option.Value)
+        end
     end
     control.Section = self
     control:SetValues(values)
@@ -1081,8 +1661,11 @@ end
 
 function Section:AddMultiDropdown(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Multi dropdown"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Multi dropdown"
+    local descriptionSource = options.Description or ""
+    local placeholderSource = options.Placeholder or { "Select...", "Выберите..." }
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local values = options.Values or options.Options or {}
     local maximum = tonumber(options.MaxSelections)
     if maximum and maximum < 1 then
@@ -1107,6 +1690,7 @@ function Section:AddMultiDropdown(options)
             Size = UDim2.new(0.55, 0, 0, 13),
             Position = UDim2.fromOffset(12, 22),
         })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
     local selector = button(frame, {
         BackgroundTransparency = 1,
@@ -1114,7 +1698,7 @@ function Section:AddMultiDropdown(options)
         Text = "",
     })
     local selectedText = text(selector, {
-        Text = options.Placeholder or "Select...",
+        Text = self.Window:_resolveLocalizedText(placeholderSource),
         AnchorPoint = Vector2.new(1, 0.5),
         TextSize = 11,
         TextTruncate = Enum.TextTruncate.AtEnd,
@@ -1133,6 +1717,7 @@ function Section:AddMultiDropdown(options)
         Size = UDim2.fromOffset(18, 22),
         Position = UDim2.new(1, -10, 0.5, 0),
     })
+    bindThemeColor(arrow, "TextColor3", "MutedText")
     local items = new("Frame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -1142,10 +1727,11 @@ function Section:AddMultiDropdown(options)
     })
     listLayout(items, 3)
 
-    local control = self:_newControl(title, description, frame)
+    local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Values = values
+    control._placeholderSource = placeholderSource
     control.MaxSelections = maximum
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
 
@@ -1174,14 +1760,15 @@ function Section:AddMultiDropdown(options)
         control.Value = chosen
         local display = {}
         for index, value in ipairs(chosen) do
-            display[index] = tostring(value)
+            display[index] = self.Window:_resolveLocalizedText(value)
         end
-        selectedText.Text = #display > 0 and table.concat(display, ", ") or (options.Placeholder or "Select...")
+        selectedText.Text = #display > 0 and table.concat(display, ", ")
+            or self.Window:_resolveLocalizedText(control._placeholderSource)
         selectedText.TextColor3 = #chosen > 0 and self.Window.Theme.Text or self.Window.Theme.SubtleText
     end
     local function refreshOptionStyles()
         for _, option in ipairs(optionButtons) do
-            local background = Color3.fromRGB(20, 20, 21)
+            local background = self.Window.Theme.DropdownOption
             if selected[option.Value] then
                 background = self.Window.Theme.Selected
             elseif option.Value == hoveredValue then
@@ -1189,6 +1776,10 @@ function Section:AddMultiDropdown(options)
             end
             tween(option.Button, 0.1, { BackgroundColor3 = background })
         end
+    end
+    control._refreshTheme = function()
+        refreshText()
+        refreshOptionStyles()
     end
     local function setOpen(open)
         isOpen = open
@@ -1205,22 +1796,32 @@ function Section:AddMultiDropdown(options)
     end
     function control:SetValue(nextValues, silent)
         local requested = {}
+        local function request(value)
+            table.insert(requested, value)
+        end
         if type(nextValues) == "table" then
             for _, value in ipairs(nextValues) do
-                requested[value] = true
+                request(value)
             end
             for value, enabled in pairs(nextValues) do
                 if type(value) ~= "number" and enabled == true then
-                    requested[value] = true
+                    request(value)
                 end
             end
         elseif nextValues ~= nil then
-            requested[nextValues] = true
+            request(nextValues)
         end
         table.clear(selected)
         local selectedCount = 0
         for _, value in ipairs(control.Values) do
-            if requested[value] and (not maximum or selectedCount < maximum) then
+            local isRequested = false
+            for _, requestedValue in ipairs(requested) do
+                if localizedValuesEqual(value, requestedValue) then
+                    isRequested = true
+                    break
+                end
+            end
+            if isRequested and (not maximum or selectedCount < maximum) then
                 selected[value] = true
                 selectedCount = selectedCount + 1
             end
@@ -1233,6 +1834,12 @@ function Section:AddMultiDropdown(options)
         return self
     end
     function control:Toggle(value, silent)
+        for _, candidate in ipairs(self.Values) do
+            if localizedValuesEqual(candidate, value) then
+                value = candidate
+                break
+            end
+        end
         local nextValues = self:GetValue()
         if selected[value] then
             for index, selectedValue in ipairs(nextValues) do
@@ -1247,8 +1854,8 @@ function Section:AddMultiDropdown(options)
         return self:SetValue(nextValues, silent)
     end
     function control:SetValues(nextValues)
-        control.Values = type(nextValues) == "table" and nextValues or {}
         local previous = selectedArray()
+        control.Values = type(nextValues) == "table" and nextValues or {}
         for _, option in ipairs(optionButtons) do
             option.Button:Destroy()
         end
@@ -1256,12 +1863,13 @@ function Section:AddMultiDropdown(options)
         for _, value in ipairs(control.Values) do
             local itemValue = value
             local itemButton = button(items, {
-                BackgroundColor3 = Color3.fromRGB(20, 20, 21),
+                BackgroundColor3 = control.Section.Window.Theme.DropdownOption,
                 Size = UDim2.new(1, 0, 0, 24),
-                Text = tostring(itemValue),
+                Text = control.Section.Window:_resolveLocalizedText(itemValue),
                 TextSize = 10,
                 TextXAlignment = Enum.TextXAlignment.Left,
             })
+            bindThemeColor(itemButton, "BackgroundColor3", "DropdownOption")
             corner(itemButton, 7)
             padding(itemButton, 8, 8)
             table.insert(optionButtons, { Value = itemValue, Button = itemButton })
@@ -1276,6 +1884,10 @@ function Section:AddMultiDropdown(options)
                 end
             end))
             control:_track(itemButton.Activated:Connect(function()
+                -- MouseLeave has not fired yet when an option is clicked. Clear
+                -- the hover state explicitly so deselecting an item does not
+                -- leave it looking hovered until the cursor is moved away.
+                hoveredValue = nil
                 control:Toggle(itemValue)
             end))
         end
@@ -1284,6 +1896,12 @@ function Section:AddMultiDropdown(options)
             setOpen(true)
         end
         return control
+    end
+    control._refreshLocalizedText = function()
+        refreshText()
+        for _, option in ipairs(optionButtons) do
+            option.Button.Text = control.Section.Window:_resolveLocalizedText(option.Value)
+        end
     end
     control:SetValue(options.Default or options.Value or {}, true)
     control:SetValues(values)
@@ -1295,15 +1913,11 @@ end
 
 function Section:AddKeybind(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Keybind"
-    local description = options.Description or ""
-    local key = options.Default or options.Value or Enum.KeyCode.RightShift
-    if type(key) == "string" then
-        key = Enum.KeyCode[key] or Enum.KeyCode.RightShift
-    end
-    if typeof(key) ~= "EnumItem" then
-        key = Enum.KeyCode.RightShift
-    end
+    local titleSource = options.Name or options.Text or "Keybind"
+    local descriptionSource = options.Description or ""
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
+    local key = resolveKeyCode(options.Default or options.Value) or Enum.KeyCode.RightShift
     local frame = self:_row(description ~= "" and 57 or 43)
     local titleLabel = text(frame, {
         Text = title,
@@ -1321,6 +1935,7 @@ function Section:AddKeybind(options)
             Size = UDim2.new(1, -100, 0, 17),
             Position = UDim2.fromOffset(10, 29),
         })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
     local bind = button(frame, {
         BackgroundColor3 = Color3.fromRGB(20, 20, 21),
@@ -1332,37 +1947,76 @@ function Section:AddKeybind(options)
         TextXAlignment = Enum.TextXAlignment.Center,
     })
     corner(bind, 5)
-    stroke(bind, self.Window.Theme.Border, 1, 0.45)
-    local control = self:_newControl(title, description, frame)
+    bindThemeColor(stroke(bind, self.Window.Theme.Border, 1, 0.45), "Color", "Border")
+    local bindGlow = uiShadow(bind, self.Window.Theme.Accent, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
+    bindThemeColor(bindGlow, "Color", "Accent")
+    bindGlow.Enabled = false
+    local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = key
     control.Key = key
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
+    control._bindChangedCallbacks = {}
+    local bindChanged = options.BindChanged or options.ChangedCallback or options.OnBindChanged
+    if type(bindChanged) == "function" then
+        table.insert(control._bindChangedCallbacks, bindChanged)
+    end
     local listening = false
-    function control:SetValue(nextKey, silent)
-        if type(nextKey) == "string" then
-            nextKey = Enum.KeyCode[nextKey]
+
+    control._refreshTheme = function()
+        if listening then
+            bind.BackgroundColor3 = self.Window.Theme.Accent
+            bindGlow.Color = self.Window.Theme.Accent
         end
-        if typeof(nextKey) ~= "EnumItem" then
-            return self
+    end
+
+    function control:_emitBindChanged(nextKey)
+        for _, callback in ipairs(self._bindChangedCallbacks) do
+            safeCall(callback, nextKey)
         end
-        self.Value = nextKey
-        self.Key = nextKey
-        bind.Text = nextKey.Name
-        if not silent then
-            self:_emit(nextKey)
-        end
+    end
+    function control:OnBindChanged(callback)
+        assert(type(callback) == "function", "OnBindChanged expects a function")
+        table.insert(self._bindChangedCallbacks, callback)
         return self
     end
+
+    local function setKey(nextKey, silent, notifyBindChanged)
+        nextKey = resolveKeyCode(nextKey)
+        if not nextKey then
+            return control
+        end
+        -- Selecting the current key while the control is listening must still
+        -- restore its caption after it was temporarily replaced with "...".
+        if control.Key == nextKey then
+            bind.Text = nextKey.Name
+            return control
+        end
+        control.Value = nextKey
+        control.Key = nextKey
+        bind.Text = nextKey.Name
+        if not silent then
+            control:_emit(nextKey)
+        end
+        if notifyBindChanged then
+            control:_emitBindChanged(nextKey)
+        end
+        return control
+    end
+    function control:SetValue(nextKey, silent)
+        return setKey(nextKey, silent, not silent)
+    end
     function control:SetKey(nextKey, silent)
-        return self:SetValue(nextKey, silent)
+        return setKey(nextKey, silent, not silent)
     end
     control:_track(bind.Activated:Connect(function()
         listening = true
         bind.Text = "..."
         tween(bind, 0.12, { BackgroundColor3 = self.Window.Theme.Accent })
         bind.TextColor3 = Color3.fromRGB(10, 10, 10)
+        bindGlow.Color = self.Window.Theme.Accent
+        bindGlow.Enabled = true
     end))
     control:_track(UserInputService.InputBegan:Connect(function(input, processed)
         if processed then
@@ -1373,7 +2027,8 @@ function Section:AddKeybind(options)
                 listening = false
                 bind.TextColor3 = self.Window.Theme.Text
                 tween(bind, 0.12, { BackgroundColor3 = Color3.fromRGB(20, 20, 21) })
-                control:SetValue(input.KeyCode, true)
+                bindGlow.Enabled = false
+                setKey(input.KeyCode, true, true)
             end
             return
         end
@@ -1386,8 +2041,10 @@ end
 
 function Section:AddColorPicker(options)
     options = normalizeOptions(options)
-    local title = options.Name or options.Text or "Color"
-    local description = options.Description or ""
+    local titleSource = options.Name or options.Text or "Color"
+    local descriptionSource = options.Description or ""
+    local title = self.Window:_resolveLocalizedText(titleSource)
+    local description = self.Window:_resolveLocalizedText(descriptionSource)
     local value = options.Default or options.Value or self.Window.Theme.Accent
     if typeof(value) ~= "Color3" then
         value = self.Window.Theme.Accent
@@ -1411,6 +2068,7 @@ function Section:AddColorPicker(options)
             Size = UDim2.new(1, -66, 0, 17),
             Position = UDim2.fromOffset(10, 29),
         })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
     local swatch = button(frame, {
         BackgroundColor3 = value,
@@ -1419,8 +2077,10 @@ function Section:AddColorPicker(options)
         Size = UDim2.fromOffset(37, 22),
         Text = "",
     })
+    preserveControlColor(swatch)
     corner(swatch, 5)
     local glow = uiShadow(swatch, value, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
+    preserveControlColor(glow)
 
     local pickerHeight = 88
     local pickerPanel = new("Frame", {
@@ -1438,6 +2098,7 @@ function Section:AddColorPicker(options)
         Size = UDim2.new(1, -24, 0, pickerHeight),
         Parent = pickerPanel,
     })
+    preserveControlColor(colorPlane)
     corner(colorPlane, 6)
     local saturationLayer = new("Frame", {
         BackgroundColor3 = Color3.fromRGB(255, 255, 255),
@@ -1445,6 +2106,7 @@ function Section:AddColorPicker(options)
         Size = UDim2.fromScale(1, 1),
         Parent = colorPlane,
     })
+    preserveControlColor(saturationLayer)
     corner(saturationLayer, 6)
     new("UIGradient", {
         Transparency = NumberSequence.new({
@@ -1459,6 +2121,7 @@ function Section:AddColorPicker(options)
         Size = UDim2.fromScale(1, 1),
         Parent = saturationLayer,
     })
+    preserveControlColor(valueLayer)
     corner(valueLayer, 6)
     new("UIGradient", {
         Rotation = 90,
@@ -1482,8 +2145,9 @@ function Section:AddColorPicker(options)
         ZIndex = 3,
         Parent = colorPlane,
     })
+    preserveControlColor(colorSelector)
     corner(colorSelector, 5)
-    stroke(colorSelector, Color3.fromRGB(12, 12, 13), 1, 0.15)
+    preserveControlColor(stroke(colorSelector, Color3.fromRGB(12, 12, 13), 1, 0.15))
 
     local hueBar = new("Frame", {
         Active = true,
@@ -1494,6 +2158,7 @@ function Section:AddColorPicker(options)
         Size = UDim2.fromOffset(16, pickerHeight),
         Parent = pickerPanel,
     })
+    preserveControlColor(hueBar)
     corner(hueBar, 5)
     new("UIGradient", {
         Rotation = 90,
@@ -1523,8 +2188,9 @@ function Section:AddColorPicker(options)
         ZIndex = 3,
         Parent = hueBar,
     })
+    preserveControlColor(hueSelector)
     corner(hueSelector, 2)
-    stroke(hueSelector, Color3.fromRGB(12, 12, 13), 1, 0.15)
+    preserveControlColor(stroke(hueSelector, Color3.fromRGB(12, 12, 13), 1, 0.15))
 
     local hexInput = new("TextBox", {
         BackgroundColor3 = Color3.fromRGB(20, 20, 21),
@@ -1540,10 +2206,12 @@ function Section:AddColorPicker(options)
         TextXAlignment = Enum.TextXAlignment.Center,
         Parent = pickerPanel,
     })
+    bindThemeColor(hexInput, "PlaceholderColor3", "SubtleText")
+    bindThemeColor(hexInput, "TextColor3", "Text")
     corner(hexInput, 5)
-    stroke(hexInput, self.Window.Theme.Border, 1, 0.45)
+    bindThemeColor(stroke(hexInput, self.Window.Theme.Border, 1, 0.45), "Color", "Border")
 
-    local control = self:_newControl(title, description, frame)
+    local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = value
@@ -1674,9 +2342,27 @@ function Section:Destroy()
     end
 end
 
+function Section:SetTitle(value)
+    self._titleSource = value
+    self.Title = self.Window:_resolveLocalizedText(value)
+    self.Instance.Name = self.Title
+    self.HeadingText.Text = self.Title
+    return self
+end
+
+function Section:_refreshLocalization()
+    self.Title = self.Window:_resolveLocalizedText(self._titleSource)
+    self.Instance.Name = self.Title
+    self.HeadingText.Text = self.Title
+    for _, control in ipairs(self.Controls) do
+        control:_refreshLocalization()
+    end
+end
+
 function Tab:Section(options)
     options = normalizeOptions(options)
-    local title = options.Title or options.Name or "Section"
+    local titleSource = options.Title or options.Name or "Section"
+    local title = self.Window:_resolveLocalizedText(titleSource)
     local sectionFrame = new("Frame", {
         Name = title,
         BackgroundTransparency = 1,
@@ -1704,10 +2390,16 @@ function Tab:Section(options)
         Text = title,
         Font = Enum.Font.GothamBold,
         TextSize = 12,
+        TextColor3 = self.Window.Theme.SectionTitle,
         AutomaticSize = Enum.AutomaticSize.X,
         Size = UDim2.new(0, 0, 1, 0),
     })
-    uiShadow(headingText, self.Window.Theme.Text, 0.88, 25, UDim2.fromOffset(0, 1),UDim2.new(0.5,0,0,0))
+    bindThemeColor(headingText, "TextColor3", "SectionTitle")
+    bindThemeColor(
+        uiShadow(headingText, self.Window.Theme.SectionTitle, 0.88, 25, UDim2.fromOffset(0, 1), UDim2.new(0.5, 0, 0, 0)),
+        "Color",
+        "SectionTitle"
+    )
     local divider = new("Frame", {
         AnchorPoint = Vector2.new(1, 0.5),
         BackgroundColor3 = self.Window.Theme.Border,
@@ -1717,6 +2409,7 @@ function Tab:Section(options)
         Size = UDim2.new(0.67, 0, 0, 1),
         Parent = heading,
     })
+    bindThemeColor(divider, "BackgroundColor3", "Border")
     local body = new("Frame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -1738,12 +2431,45 @@ function Tab:Section(options)
         Body = body,
         Controls = {},
         Title = title,
+        _titleSource = titleSource,
     }, Section)
     table.insert(self.Sections, section)
     return section
 end
 
 Tab.CreateSection = Tab.Section
+
+function Tab:SetTitle(value)
+    self._nameSource = value
+    self.Name = self.Window:_resolveLocalizedText(value)
+    self.Button.Name = self.Name
+    self.Page.Name = self.Name .. "Page"
+    self.TitleLabel.Text = self.Name
+    if self.Selected then
+        self.Window:SelectTab(self)
+    end
+    return self
+end
+
+function Tab:SetDescription(value)
+    self._descriptionSource = value
+    self.Description = self.Window:_resolveLocalizedText(value)
+    if self.Selected then
+        self.Window:SelectTab(self)
+    end
+    return self
+end
+
+function Tab:_refreshLocalization()
+    self.Name = self.Window:_resolveLocalizedText(self._nameSource)
+    self.Description = self.Window:_resolveLocalizedText(self._descriptionSource)
+    self.Button.Name = self.Name
+    self.Page.Name = self.Name .. "Page"
+    self.TitleLabel.Text = self.Name
+    for _, section in ipairs(self.Sections) do
+        section:_refreshLocalization()
+    end
+end
 
 function Tab:SetIcon(icon, iconTint)
     local image = resolveIcon(icon)
@@ -1765,9 +2491,9 @@ function Tab:Select()
 end
 
 function Tab:SetVisible(visible)
-    self.Button.Visible = visible ~= false
+    self.ButtonContainer.Visible = visible ~= false
     if visible == false then
-        self.Page.Visible = false
+        self.PageContainer.Visible = false
     end
     return self
 end
@@ -1777,12 +2503,67 @@ function Tab:Destroy()
         section:Destroy()
     end
     table.clear(self.Sections)
-    if self.Button then
-        self.Button:Destroy()
+    if self.ButtonContainer then
+        self.ButtonContainer:Destroy()
     end
-    if self.Page then
-        self.Page:Destroy()
+    if self.PageContainer then
+        self.PageContainer:Destroy()
     end
+end
+
+function Window:_resolveLocalizedText(value)
+    return localizedText(value, self.Language)
+end
+
+function Window:GetLanguage()
+    return self.Language
+end
+
+function Window:_refreshLocalization()
+    self.Title = self:_resolveLocalizedText(self._titleSource)
+    self.Subtitle = self:_resolveLocalizedText(self._subtitleSource)
+    self.BrandTitle.Text = self.Title
+    self.BrandSubtitle.Text = self.Subtitle
+    if self.SessionPanelTitle then
+        self.SessionPanelTitle.Text = self.Title
+    end
+    self.RestoreTitle.Text = self.Title
+    self.FooterText.Text = self:_resolveLocalizedText(self._footerSource)
+    self.SearchBox.PlaceholderText = self:_resolveLocalizedText(self._searchPlaceholderSource)
+    if self.LogoLabel then
+        self.LogoLabel.Text = self:_resolveLocalizedText(self._logoTextSource)
+    end
+    if self.SessionPanelLogoLabel then
+        self.SessionPanelLogoLabel.Text = self:_resolveLocalizedText(self._logoTextSource)
+    end
+    if self.RestoreButton then
+        self.RestoreButton.Text = self:_resolveLocalizedText(self._restoreTextSource)
+    end
+    for _, tab in ipairs(self.Tabs) do
+        tab:_refreshLocalization()
+    end
+    if self.SelectedTab then
+        self:SelectTab(self.SelectedTab)
+    else
+        self.PageTitle.Text = self.Title
+        self.PageSubtitle.Text = self.Subtitle
+        self.PageSubtitle.Visible = self.Subtitle ~= ""
+    end
+    if self._refreshNotifications then
+        self:_refreshNotifications()
+    end
+    self:Search(self.SearchBox.Text)
+end
+
+function Window:SetLanguage(language)
+    local resolved = normalizeLanguage(language)
+    assert(resolved, "SetLanguage expects 'en' or 'ru'")
+    if self.Language ~= resolved then
+        self.Language = resolved
+        self.SearchBox.Text = ""
+        self:_refreshLocalization()
+    end
+    return self
 end
 
 function Window:_track(connection)
@@ -1799,6 +2580,10 @@ function Window:_styleTab(tab, selected)
     local icon = tab.IconLabel
     local iconGlow = tab.IconGlow
     local label = tab.TitleLabel
+    if tab._hoverTween then
+        tab._hoverTween:Cancel()
+        tab._hoverTween = nil
+    end
     local background = selected and self.Theme.Selected or self.Theme.Sidebar
     buttonFrame.BackgroundColor3 = background
     if tab.IconTint then
@@ -1812,9 +2597,16 @@ function Window:_styleTab(tab, selected)
     if shouldGlow then
         iconGlow.Color = self.Theme.Accent
         iconGlow.Enabled = true
-        tween(iconGlow, 0.18, { Transparency = tab.IconGlowTransparency })
+        iconGlow.BlurRadius = UDim.new()
+        tween(iconGlow, 0.18, {
+            Transparency = tab.IconGlowTransparency,
+            BlurRadius = tab.IconGlowRadius,
+        })
     else
-        tween(iconGlow, 0.12, { Transparency = 1 })
+        tween(iconGlow, 0.12, {
+            Transparency = 1,
+            BlurRadius = UDim.new(),
+        })
         task.delay(0.12, function()
             if tab._iconGlowToken == glowToken and not tab.Selected then
                 iconGlow.Enabled = false
@@ -1823,6 +2615,204 @@ function Window:_styleTab(tab, selected)
     end
     label.TextColor3 = selected and self.Theme.Text or self.Theme.MutedText
     label.Font = selected and Enum.Font.GothamBold or Enum.Font.GothamMedium
+end
+
+-- UIListLayout owns the position of each tab container. Moving the button
+-- inside that container keeps the layout stable while giving tabs an entrance
+-- from the left. The same helpers are reused whenever the whole window opens.
+function Window:_trackContentTween(animation)
+    self._contentTweens = self._contentTweens or {}
+    table.insert(self._contentTweens, animation)
+    return animation
+end
+
+function Window:_playTabEntrance(tab, delayTime)
+    if not tab.ButtonContainer.Visible then
+        return
+    end
+    if not self.AnimationsEnabled then
+        tab.ButtonContainer.GroupTransparency = 0
+        tab.Button.Position = UDim2.new()
+        return
+    end
+
+    tab.ButtonContainer.GroupTransparency = 1
+    tab.Button.Position = UDim2.fromOffset(-14, 0)
+    self:_trackContentTween(tween(tab.ButtonContainer, 0.22, {
+        GroupTransparency = 0,
+    }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, delayTime))
+    self:_trackContentTween(tween(tab.Button, 0.22, {
+        Position = UDim2.new(),
+    }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, delayTime))
+end
+
+function Window:_animateTabEntrance(tab)
+    if tab._hasPlayedEntrance then
+        return
+    end
+    tab._hasPlayedEntrance = true
+    self:_playTabEntrance(tab, math.min((#self.Tabs - 1) * 0.045, 0.27))
+end
+
+function Window:_playTabsEntrance()
+    local visibleIndex = 0
+    for _, tab in ipairs(self.Tabs) do
+        if tab.ButtonContainer.Visible then
+            self:_playTabEntrance(tab, math.min(visibleIndex * 0.045, 0.27))
+            visibleIndex = visibleIndex + 1
+        end
+    end
+end
+
+function Window:_playTabsExit(duration, stagger, maximumDelay)
+    duration = duration or CONTENT_EXIT_DURATION
+    stagger = stagger or CONTENT_EXIT_STAGGER
+    maximumDelay = maximumDelay or 0.04
+    local delayIndex = 0
+    for index = #self.Tabs, 1, -1 do
+        local tab = self.Tabs[index]
+        if tab.ButtonContainer.Visible then
+            local delayTime = math.min(delayIndex * stagger, maximumDelay)
+            self:_trackContentTween(tween(tab.ButtonContainer, duration, {
+                GroupTransparency = 1,
+            }, Enum.EasingStyle.Quint, Enum.EasingDirection.In, delayTime))
+            self:_trackContentTween(tween(tab.Button, duration, {
+                Position = UDim2.fromOffset(-14, 0),
+            }, Enum.EasingStyle.Quint, Enum.EasingDirection.In, delayTime))
+            delayIndex = delayIndex + 1
+        end
+    end
+end
+
+function Window:_playPageEntrance(tab, delayTime)
+    local pageContainer = tab.PageContainer
+    pageContainer.Visible = true
+    if not self.AnimationsEnabled then
+        pageContainer.GroupTransparency = 0
+        tab.Content.Position = tab.ContentPosition
+        return
+    end
+
+    pageContainer.GroupTransparency = 1
+    tab.Content.Position = UDim2.new(
+        tab.ContentPosition.X.Scale,
+        tab.ContentPosition.X.Offset + 14,
+        tab.ContentPosition.Y.Scale,
+        tab.ContentPosition.Y.Offset
+    )
+    self:_trackContentTween(tween(pageContainer, 0.22, {
+        GroupTransparency = 0,
+    }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, delayTime))
+    self:_trackContentTween(tween(tab.Content, 0.22, {
+        Position = tab.ContentPosition,
+    }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, delayTime))
+end
+
+function Window:_playPageExit(tab, duration)
+    local pageContainer = tab.PageContainer
+    if not pageContainer.Visible then
+        return
+    end
+    duration = duration or CONTENT_EXIT_DURATION
+
+    self:_trackContentTween(tween(pageContainer, duration, {
+        GroupTransparency = 1,
+    }, Enum.EasingStyle.Quint, Enum.EasingDirection.In))
+    self:_trackContentTween(tween(tab.Content, duration, {
+        Position = UDim2.new(
+            tab.ContentPosition.X.Scale,
+            tab.ContentPosition.X.Offset + 14,
+            tab.ContentPosition.Y.Scale,
+            tab.ContentPosition.Y.Offset
+        ),
+    }, Enum.EasingStyle.Quint, Enum.EasingDirection.In))
+end
+
+-- UIListLayout owns every control position, so an unload cannot animate those
+-- positions in place. Move the live headings and controls into a temporary
+-- overlay first, preserving their rendered bounds, then send them out
+-- bottom-to-top. The window is destroyed immediately after this animation, so
+-- no restore is necessary and ordinary toggles keep their normal layout.
+function Window:_playUnloadPageExit(tab, duration, stagger, maximumDelay)
+    local pageContainer = tab.PageContainer
+    if not pageContainer.Visible then
+        return
+    end
+
+    local stagedObjects = {}
+    local function stage(instance)
+        if instance and instance.Parent and instance.Visible then
+            table.insert(stagedObjects, {
+                Instance = instance,
+                Position = instance.AbsolutePosition,
+                Size = instance.AbsoluteSize,
+            })
+        end
+    end
+    for index = #tab.Sections, 1, -1 do
+        local section = tab.Sections[index]
+        for controlIndex = #section.Controls, 1, -1 do
+            stage(section.Controls[controlIndex].Instance)
+        end
+        stage(section.Heading)
+    end
+    if #stagedObjects == 0 then
+        return
+    end
+
+    local exitLayer = new("Frame", {
+        Name = "UnloadExitLayer",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Size = UDim2.fromScale(1, 1),
+        ZIndex = 2,
+        Parent = pageContainer,
+    })
+    local pageOrigin = pageContainer.AbsolutePosition
+    for _, staged in ipairs(stagedObjects) do
+        local object = staged.Instance
+        object.AutomaticSize = Enum.AutomaticSize.None
+        object.Size = UDim2.fromOffset(staged.Size.X, staged.Size.Y)
+        object.Position = UDim2.fromOffset(
+            staged.Position.X - pageOrigin.X,
+            staged.Position.Y - pageOrigin.Y
+        )
+        object.Parent = exitLayer
+    end
+
+    for index, staged in ipairs(stagedObjects) do
+        local object = staged.Instance
+        local delayTime = math.min((index - 1) * stagger, maximumDelay)
+        local position = object.Position
+        self:_trackContentTween(tween(object, duration, {
+            Position = UDim2.new(
+                position.X.Scale,
+                position.X.Offset + 18,
+                position.Y.Scale,
+                position.Y.Offset
+            ),
+        }, Enum.EasingStyle.Quint, Enum.EasingDirection.In, delayTime))
+    end
+end
+
+function Window:_showTabPage(tab, visible)
+    local pageContainer = tab.PageContainer
+    if not visible then
+        pageContainer.Visible = false
+        return
+    end
+
+    if not self.AnimationsEnabled then
+        pageContainer.Visible = true
+        pageContainer.GroupTransparency = 0
+        tab.Content.Position = tab.ContentPosition
+        return
+    end
+
+    local hasPlayedEntrance = tab._hasPlayedPageEntrance
+    tab._hasPlayedPageEntrance = true
+    self:_playPageEntrance(tab, hasPlayedEntrance and 0 or 0.08)
 end
 
 function Window:SelectTab(target)
@@ -1837,10 +2827,16 @@ function Window:SelectTab(target)
     if getmetatable(target) ~= Tab then
         return nil
     end
+    if self.SelectedTab == target then
+        self.PageTitle.Text = target.Name
+        self.PageSubtitle.Text = target.Description or self.Subtitle or ""
+        self.PageSubtitle.Visible = self.PageSubtitle.Text ~= ""
+        return target
+    end
     for _, tab in ipairs(self.Tabs) do
         local selected = tab == target
         tab.Selected = selected
-        tab.Page.Visible = selected
+        self:_showTabPage(tab, selected)
         self:_styleTab(tab, selected)
     end
     self.SelectedTab = target
@@ -1852,12 +2848,25 @@ end
 
 function Window:Tab(options)
     options = normalizeOptions(options)
-    local name = options.Name or options.Title or "Tab"
+    local nameSource = options.Name or options.Title or "Tab"
+    local descriptionSource = options.Description or ""
+    local name = self:_resolveLocalizedText(nameSource)
+    local description = self:_resolveLocalizedText(descriptionSource)
     local iconImage = resolveIcon(options.Icon or options.Image)
     local hasIcon = iconImage ~= ""
-    local tabButton = button(self.NavList, {
+    local tabContainer = new("CanvasGroup", {
+        Name = name .. "Entrance",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        GroupTransparency = self.AnimationsEnabled and 1 or 0,
+        Size = UDim2.new(1, 0, 0, 31),
+        Parent = self.NavList,
+    })
+    local tabButton = button(tabContainer, {
         Name = name,
         BackgroundColor3 = self.Theme.Sidebar,
+        Position = self.AnimationsEnabled and UDim2.fromOffset(-14, 0) or UDim2.new(),
         Size = UDim2.new(1, 0, 0, 31),
         Text = "",
     })
@@ -1878,7 +2887,9 @@ function Window:Tab(options)
     -- The third uiShadow argument is the transparency the glow reaches when the tab is selected.
     local iconGlow = uiShadow(icon, self.Theme.Accent, 0.85, 7, UDim2.new(), UDim2.fromOffset(1, 1))
     local iconGlowTransparency = iconGlow.Transparency
+    local iconGlowRadius = iconGlow.BlurRadius
     iconGlow.Transparency = 1
+    iconGlow.BlurRadius = UDim.new()
     iconGlow.Enabled = false
     local label = text(tabButton, {
         Text = name,
@@ -1889,9 +2900,19 @@ function Window:Tab(options)
         Size = UDim2.new(1, hasIcon and -40 or -22, 1, 0),
         Position = UDim2.fromOffset(hasIcon and 34 or 12, 0),
     })
+    local pageContainer = new("CanvasGroup", {
+        Name = name .. "PageContainer",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        GroupTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        Visible = false,
+        Parent = self.Pages,
+    })
     local page = new("ScrollingFrame", {
         Name = name .. "Page",
-        Active = true,
+        Active = self.IsMobile,
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -1900,9 +2921,9 @@ function Window:Tab(options)
         ScrollBarThickness = 3,
         ScrollingDirection = Enum.ScrollingDirection.Y,
         Size = UDim2.fromScale(1, 1),
-        Visible = false,
-        Parent = self.Pages,
+        Parent = pageContainer,
     })
+    bindThemeColor(page, "ScrollBarImageColor3", "Border")
     local content = new("Frame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -1918,16 +2939,22 @@ function Window:Tab(options)
         Type = "Tab",
         Window = self,
         Name = name,
-        Description = options.Description,
+        Description = description,
+        _nameSource = nameSource,
+        _descriptionSource = descriptionSource,
         Icon = iconImage,
         IconTint = options.IconTint ~= false,
+        ButtonContainer = tabContainer,
         Button = tabButton,
         IconLabel = icon,
         IconGlow = iconGlow,
         IconGlowTransparency = iconGlowTransparency,
+        IconGlowRadius = iconGlowRadius,
         TitleLabel = label,
+        PageContainer = pageContainer,
         Page = page,
         Content = content,
+        ContentPosition = UDim2.fromOffset(11, 9),
         Sections = {},
         Selected = false,
     }, Tab)
@@ -1937,53 +2964,232 @@ function Window:Tab(options)
     end))
     self:_track(tabButton.MouseEnter:Connect(function()
         if not tab.Selected then
-            tween(tabButton, 0.12, { BackgroundColor3 = self.Theme.Surface })
+            if tab._hoverTween then
+                tab._hoverTween:Cancel()
+            end
+            tab._hoverTween = tween(tabButton, 0.12, { BackgroundColor3 = self.Theme.Surface })
         end
     end))
     self:_track(tabButton.MouseLeave:Connect(function()
         if not tab.Selected then
-            tween(tabButton, 0.12, { BackgroundColor3 = self.Theme.Sidebar })
+            if tab._hoverTween then
+                tab._hoverTween:Cancel()
+            end
+            tab._hoverTween = tween(tabButton, 0.12, { BackgroundColor3 = self.Theme.Sidebar })
         end
     end))
     self:_styleTab(tab, false)
     if options.Select == true or options.Selected == true or #self.Tabs == 1 then
         self:SelectTab(tab)
     end
+    self:_animateTabEntrance(tab)
     return tab
 end
 
 Window.CreateTab = Window.Tab
 
-function Window:SetAccent(color)
-    assert(typeof(color) == "Color3", "SetAccent expects Color3")
-    local oldAccent = self.Theme.Accent
-    self.Theme.Accent = color
-    for _, descendant in ipairs(self.Root:GetDescendants()) do
-        if descendant:IsA("GuiObject") and descendant.BackgroundColor3 == oldAccent then
-            descendant.BackgroundColor3 = color
-        elseif descendant:IsA("UIStroke") and descendant.Color == oldAccent then
-            descendant.Color = color
-        elseif descendant:IsA("UIShadow") and descendant.Color == oldAccent then
-            descendant.Color = color
-        elseif descendant:IsA("TextLabel") and descendant.TextColor3 == oldAccent then
-            descendant.TextColor3 = color
+function Window:_refreshThemeBindings(changedKey)
+    if not self.ScreenGui then
+        return
+    end
+    for _, descendant in ipairs(self.ScreenGui:GetDescendants()) do
+        for _, property in ipairs(ThemeColorProperties) do
+            local themeKey = descendant:GetAttribute("AverlikTheme_" .. property)
+            if themeKey and (changedKey == nil or themeKey == changedKey) then
+                descendant[property] = self._theme[themeKey]
+            end
         end
+    end
+end
+
+function Window:_refreshThemeState()
+    if self._refreshChromeTheme then
+        self:_refreshChromeTheme()
     end
     for _, tab in ipairs(self.Tabs) do
         self:_styleTab(tab, tab.Selected)
+        for _, section in ipairs(tab.Sections) do
+            for _, control in ipairs(section.Controls) do
+                if control._refreshTheme then
+                    control:_refreshTheme()
+                end
+            end
+        end
+    end
+end
+
+function Window:SetThemeColor(name, color)
+    assert(type(name) == "string" and typeof(self._theme[name]) == "Color3", "SetThemeColor expects a theme color name")
+    assert(typeof(color) == "Color3", "SetThemeColor expects Color3")
+    if self._theme[name] == color then
+        return self
+    end
+    self._theme[name] = color
+    self:_refreshThemeBindings(name)
+    self:_refreshThemeState()
+    return self
+end
+
+function Window:SetTheme(colors)
+    assert(type(colors) == "table", "SetTheme expects a table of theme colors")
+    for name, color in pairs(colors) do
+        self:SetThemeColor(name, color)
     end
     return self
 end
 
+function Window:GetTheme()
+    return cloneTable(self._theme)
+end
+
+function Window:SetAccent(color)
+    return self:SetThemeColor("Accent", color)
+end
+
+function Window:SetTransparency(value)
+    assert(type(value) == "number", "SetTransparency expects a number from 0 to 1")
+    value = math.clamp(value, 0, 1)
+    self.Transparency = value
+    self._restingGroupTransparency = value
+    if self.Shadow then
+        self.Shadow.Transparency = compositeTransparency(self._shadowBaseTransparency, value)
+    end
+    if self.Visible and self.Root then
+        -- Apply this directly: sliders call the setter repeatedly and should
+        -- track the thumb without a queue of competing tweens.
+        self.Root.GroupTransparency = value
+    end
+    return self
+end
+
+function Window:GetTransparency()
+    return self.Transparency
+end
+
+function Window:SetToggleKey(key)
+    if key == nil or key == false then
+        self.ToggleKey = nil
+        return self
+    end
+    key = resolveKeyCode(key)
+    assert(key, "SetToggleKey expects an Enum.KeyCode, its name, or nil")
+    self.ToggleKey = key
+    return self
+end
+
+function Window:GetToggleKey()
+    return self.ToggleKey
+end
+
+Window.SetKeybind = Window.SetToggleKey
+Window.SetToggleBind = Window.SetToggleKey
+
+local function cancelTweens(tweens)
+    if not tweens then
+        return
+    end
+    for _, animation in ipairs(tweens) do
+        local state = animation.PlaybackState
+        if state == Enum.PlaybackState.Playing or state == Enum.PlaybackState.Delayed then
+            animation:Cancel()
+        end
+    end
+    table.clear(tweens)
+end
+
+function Window:_cancelVisibilityAnimations()
+    cancelTweens(self._entranceTweens)
+    cancelTweens(self._visibilityTweens)
+    cancelTweens(self._contentTweens)
+end
+
 function Window:SetVisible(visible)
-    self.ScreenGui.Enabled = visible ~= false
-    self.Visible = visible ~= false
+    if self._unloading then
+        return self
+    end
+    local nextVisible = visible ~= false
+    if self.Visible == nextVisible then
+        return self
+    end
+
+    self.Visible = nextVisible
+    self._visibilityToken = (self._visibilityToken or 0) + 1
+    local visibilityToken = self._visibilityToken
+    self:_cancelVisibilityAnimations()
+
+    local root = self.Root
+    local restingTransparency = self._restingGroupTransparency or 0.04
+    local shadow = self.Shadow
+    local restingShadowTransparency = compositeTransparency(
+        self._shadowBaseTransparency or WINDOW_SHADOW_TRANSPARENCY,
+        restingTransparency
+    )
+    if not self.AnimationsEnabled or not root then
+        self.WindowLayer.Visible = nextVisible
+        if root then
+            root.GroupTransparency = restingTransparency
+        end
+        if shadow then
+            shadow.Transparency = restingShadowTransparency
+        end
+        return self
+    end
+
+    if nextVisible then
+        self.WindowLayer.Visible = true
+        root.GroupTransparency = WINDOW_HIDDEN_TRANSPARENCY
+        if shadow then
+            shadow.Transparency = WINDOW_HIDDEN_TRANSPARENCY
+        end
+        self._visibilityTweens = {
+            tween(root, WINDOW_TRANSITION_DURATION, {
+                GroupTransparency = restingTransparency,
+            }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+        }
+        if shadow then
+            table.insert(self._visibilityTweens, tween(shadow, WINDOW_TRANSITION_DURATION, {
+                Transparency = restingShadowTransparency,
+            }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out))
+        end
+        self:_playTabsEntrance()
+        if self.SelectedTab then
+            self:_playPageEntrance(self.SelectedTab, 0.08)
+        end
+        return self
+    end
+
+    if self.SelectedTab then
+        self:_playPageExit(self.SelectedTab)
+    end
+    self:_playTabsExit()
+    self._visibilityTweens = {
+        tween(root, WINDOW_CLOSE_DURATION, {
+            GroupTransparency = WINDOW_HIDDEN_TRANSPARENCY,
+        }, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
+    }
+    if shadow then
+        table.insert(self._visibilityTweens, tween(shadow, WINDOW_CLOSE_DURATION, {
+            Transparency = WINDOW_HIDDEN_TRANSPARENCY,
+        }, Enum.EasingStyle.Quint, Enum.EasingDirection.In))
+    end
+
+    local completionConnection
+    completionConnection = self._visibilityTweens[1].Completed:Connect(function(playbackState)
+        completionConnection:Disconnect()
+        if playbackState == Enum.PlaybackState.Completed
+            and self._visibilityToken == visibilityToken
+            and not self.Visible then
+            self.WindowLayer.Visible = false
+            table.clear(self._visibilityTweens)
+        end
+    end)
     return self
 end
 
 function Window:SetPosition(position)
     assert(typeof(position) == "UDim2", "SetPosition expects UDim2")
-    self.Root.Position = position
+    self.Position = position
+    self.Root.Position = centeredWindowPosition(position, self.Root.Size)
     return self
 end
 
@@ -1992,6 +3198,7 @@ function Window:SetSize(size)
     self._expandedSize = size
     if not self.Minimized then
         self.Root.Size = size
+        self.Root.Position = centeredWindowPosition(self.Position, size)
     end
     return self
 end
@@ -2004,11 +3211,77 @@ function Window:Toggle()
     return self:SetVisible(not self.Visible)
 end
 
+-- Fades the entire window and its persistent session panel without changing
+-- either size. Library:Unload coordinates this for every active window, then
+-- performs the actual destruction after the last fade finishes.
+function Window:_playUnloadAnimation(completed)
+    if self._unloading then
+        return false
+    end
+    self._unloading = true
+    self:_cancelVisibilityAnimations()
+
+    local function finish()
+        if completed then
+            completed()
+        end
+    end
+
+    local windowLayer = self.WindowLayer
+    if not self.AnimationsEnabled or not windowLayer then
+        finish()
+        return true
+    end
+
+    windowLayer.Visible = true
+    windowLayer.GroupTransparency = 0
+    if self.SessionPanel then
+        self.SessionPanel.GroupTransparency = 0
+    end
+    -- Reuse the normal close directions, but stretch them to match the
+    -- longer unload fade: navigation exits left while page content exits right.
+    local contentExitDuration = WINDOW_UNLOAD_DURATION * 0.35
+    local contentExitStagger = WINDOW_UNLOAD_DURATION * 0.035
+    local maximumContentExitDelay = WINDOW_UNLOAD_DURATION * 0.55
+    if self.SelectedTab then
+        self:_playUnloadPageExit(
+            self.SelectedTab,
+            contentExitDuration,
+            contentExitStagger,
+            maximumContentExitDelay
+        )
+    end
+    self:_playTabsExit(contentExitDuration, contentExitStagger, maximumContentExitDelay)
+    local fade = tween(windowLayer, WINDOW_UNLOAD_DURATION, {
+        GroupTransparency = 1,
+    }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+    if self.SessionPanel then
+        tween(self.SessionPanel, WINDOW_UNLOAD_DURATION, {
+            GroupTransparency = 1,
+        }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+    end
+    fade.Completed:Connect(function(playbackState)
+        if playbackState == Enum.PlaybackState.Completed then
+            finish()
+        end
+    end)
+    return true
+end
+
 function Window:SetTitle(title, subtitle)
-    self.Title = tostring(title or self.Title)
-    self.Subtitle = subtitle == nil and self.Subtitle or tostring(subtitle)
+    if title ~= nil then
+        self._titleSource = title
+    end
+    if subtitle ~= nil then
+        self._subtitleSource = subtitle
+    end
+    self.Title = self:_resolveLocalizedText(self._titleSource)
+    self.Subtitle = self:_resolveLocalizedText(self._subtitleSource)
     self.BrandTitle.Text = self.Title
     self.BrandSubtitle.Text = self.Subtitle
+    if self.SessionPanelTitle then
+        self.SessionPanelTitle.Text = self.Title
+    end
     self.RestoreTitle.Text = self.Title
     if self.SelectedTab then
         self.PageSubtitle.Text = self.SelectedTab.Description or self.Subtitle or ""
@@ -2017,14 +3290,26 @@ function Window:SetTitle(title, subtitle)
     return self
 end
 
+function Window:SetFooter(textValue)
+    self._footerSource = textValue
+    self.FooterText.Text = self:_resolveLocalizedText(textValue)
+    return self
+end
+
+function Window:SetFooterCallback(callback)
+    assert(callback == nil or type(callback) == "function", "SetFooterCallback expects a function or nil")
+    self._footerCallback = callback
+    return self
+end
+
 function Window:Search(query)
-    query = string.lower(tostring(query or ""))
+    query = searchLower(query)
     if self.SearchBox.Text ~= query then
         self.SearchBox.Text = query
     end
     for _, tab in ipairs(self.Tabs) do
         for _, section in ipairs(tab.Sections) do
-            local sectionMatches = string.find(string.lower(section.Title), query, 1, true) ~= nil
+            local sectionMatches = string.find(searchLower(section.Title), query, 1, true) ~= nil
             local visibleControls = 0
             for _, control in ipairs(section.Controls) do
                 local matches = query == "" or string.find(control._searchText, query, 1, true) ~= nil
@@ -2052,25 +3337,36 @@ function Window:Minimize(state)
             or Vector2.new(460, 300)
     end
     local target = self.Minimized and UDim2.fromOffset(self.Root.AbsoluteSize.X, 42) or self._expandedSize
-    tween(self.Root, 0.18, { Size = target })
+    tween(self.Root, 0.18, {
+        Size = target,
+        Position = centeredWindowPosition(self.Position, target),
+    })
     return self
+end
+
+function Window:_refreshNotifications()
+    for _, notification in ipairs(self._notifications) do
+        if notification.Toast.Parent then
+            notification:Refresh(self)
+        end
+    end
 end
 
 function Window:_layoutNotifications()
     local notifications = self._notifications
     for index = #notifications, 1, -1 do
-        if not notifications[index].Parent then
+        if not notifications[index].Toast.Parent then
             table.remove(notifications, index)
         end
     end
-    for index, toast in ipairs(notifications) do
-        tween(toast, 0.18, { Position = UDim2.new(1, -285, 0, (index - 1) * 72) }, Enum.EasingStyle.Quint)
+    for index, notification in ipairs(notifications) do
+        tween(notification.Toast, 0.18, { Position = UDim2.new(1, -285, 0, (index - 1) * 72) }, Enum.EasingStyle.Quint)
     end
 end
 
-function Window:_removeNotification(toast)
-    for index, activeToast in ipairs(self._notifications) do
-        if activeToast == toast then
+function Window:_removeNotification(notification)
+    for index, activeNotification in ipairs(self._notifications) do
+        if activeNotification == notification then
             table.remove(self._notifications, index)
             break
         end
@@ -2080,8 +3376,10 @@ end
 
 function Window:Notify(options)
     options = normalizeOptions(options)
-    local title = options.Title or "Notification"
-    local content = options.Content or options.Description or ""
+    local titleSource = options.Title or "Notification"
+    local contentSource = options.Content or options.Description or ""
+    local title = self:_resolveLocalizedText(titleSource)
+    local content = self:_resolveLocalizedText(contentSource)
     local duration = tonumber(options.Duration) or 4
     local accent = options.Color or self.Theme.Accent
     local notificationIndex = #self._notifications
@@ -2093,7 +3391,7 @@ function Window:Notify(options)
         Parent = self.Notifications,
     })
     corner(toast, 8)
-    stroke(toast, self.Theme.Border, 1, 0.35)
+    bindThemeColor(stroke(toast, self.Theme.Border, 1, 0.35), "Color", "Border")
     local accentBar = new("Frame", {
         BackgroundColor3 = accent,
         BorderSizePixel = 0,
@@ -2101,10 +3399,16 @@ function Window:Notify(options)
         Position = UDim2.fromOffset(8, 11),
         Parent = toast,
     })
+    if options.Color == nil then
+        bindThemeColor(accentBar, "BackgroundColor3", "Accent")
+    end
     corner(accentBar, 2)
-    uiShadow(accentBar, accent, 0, 10, UDim2.new(), UDim2.fromOffset(1, 1))
+    local accentShadow = uiShadow(accentBar, accent, 0, 10, UDim2.new(), UDim2.fromOffset(1, 1))
+    if options.Color == nil then
+        bindThemeColor(accentShadow, "Color", "Accent")
+    end
     local hasContent = content ~= ""
-    text(toast, {
+    local titleLabel = text(toast, {
         Text = title,
         Font = Enum.Font.GothamBold,
         TextSize = 13,
@@ -2112,22 +3416,39 @@ function Window:Notify(options)
         Size = UDim2.new(1, -35, 0, hasContent and 19 or 64),
         Position = UDim2.fromOffset(20, hasContent and 8 or 0),
     })
-    if hasContent then
-        text(toast, {
-            Text = content,
-            TextSize = 10,
-            TextColor3 = self.Theme.MutedText,
-            TextWrapped = true,
-            TextYAlignment = Enum.TextYAlignment.Center,
-            Size = UDim2.new(1, -35, 0, 25),
-            Position = UDim2.fromOffset(20, 29),
-        })
+    local contentLabel = text(toast, {
+        Text = content,
+        TextSize = 10,
+        TextColor3 = self.Theme.MutedText,
+        TextWrapped = true,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        Size = UDim2.new(1, -35, 0, 25),
+        Position = UDim2.fromOffset(20, 29),
+        Visible = hasContent,
+    })
+    bindThemeColor(contentLabel, "TextColor3", "MutedText")
+    local notification = {
+        Toast = toast,
+        TitleSource = titleSource,
+        ContentSource = contentSource,
+        TitleLabel = titleLabel,
+        ContentLabel = contentLabel,
+    }
+    function notification:Refresh(window)
+        local localizedTitle = window:_resolveLocalizedText(self.TitleSource)
+        local localizedContent = window:_resolveLocalizedText(self.ContentSource)
+        local hasLocalizedContent = localizedContent ~= ""
+        self.TitleLabel.Text = localizedTitle
+        self.TitleLabel.Size = UDim2.new(1, -35, 0, hasLocalizedContent and 19 or 64)
+        self.TitleLabel.Position = UDim2.fromOffset(20, hasLocalizedContent and 8 or 0)
+        self.ContentLabel.Text = localizedContent
+        self.ContentLabel.Visible = hasLocalizedContent
     end
-    table.insert(self._notifications, toast)
+    table.insert(self._notifications, notification)
     self:_layoutNotifications()
     task.delay(math.max(duration, 0.1), function()
         if toast.Parent then
-            self:_removeNotification(toast)
+            self:_removeNotification(notification)
             local currentY = toast.Position.Y
             local out = tween(toast, 0.18, {
                 Position = UDim2.new(1, 295, currentY.Scale, currentY.Offset),
@@ -2140,6 +3461,222 @@ function Window:Notify(options)
     end)
     return toast
 end
+
+function Configurations:_resolvePath(name)
+    local configName, nameError = normalizeConfigName(name, self.Extension)
+    if not configName then
+        return nil, nameError
+    end
+    return self.Folder .. "/" .. configName .. self.Extension, configName
+end
+
+function Configurations:_serialize()
+    local values = {}
+    for _, control in ipairs(self.Window._configControls) do
+        if control.SaveConfig ~= false then
+            local value = control:GetValue()
+            if value ~= nil then
+                local serialized, serializeError = serializeConfigValue(value)
+                if serialized == nil then
+                    return nil, "Cannot save '" .. control.Flag .. "': " .. tostring(serializeError)
+                end
+                values[control.Flag] = serialized
+            end
+        end
+    end
+    local encoded, encodeError = pcall(HttpService.JSONEncode, HttpService, {
+        Version = 1,
+        Values = values,
+    })
+    if not encoded then
+        return nil, "Unable to encode config: " .. tostring(encodeError)
+    end
+    return encodeError
+end
+
+function Configurations:List()
+    local available, availabilityError = requireFilesystemFunctions("isfile", "listfiles")
+    if not available then
+        return nil, availabilityError
+    end
+    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    if not folderReady then
+        return nil, folderError
+    end
+    local listed, files = callFilesystem("listfiles", self.Folder)
+    if not listed then
+        return nil, "Unable to list configs: " .. tostring(files)
+    end
+
+    local configs = {}
+    for _, path in ipairs(files or {}) do
+        if type(path) == "string" then
+            local fileChecked, isFile = callFilesystem("isfile", path)
+            if not fileChecked then
+                return nil, "Unable to inspect config file: " .. tostring(isFile)
+            end
+            local filename = string.match(path, "([^/\\]+)$") or path
+            if isFile and string.sub(filename, -#self.Extension) == self.Extension then
+                table.insert(configs, string.sub(filename, 1, #filename - #self.Extension))
+            end
+        end
+    end
+    table.sort(configs, function(left, right)
+        return string.lower(left) < string.lower(right)
+    end)
+    return configs
+end
+
+function Configurations:Create(name)
+    local path, configName = self:_resolvePath(name)
+    if not path then
+        return false, configName
+    end
+    local available, availabilityError = requireFilesystemFunctions("isfile", "writefile")
+    if not available then
+        return false, availabilityError
+    end
+    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    if not folderReady then
+        return false, folderError
+    end
+    local checked, exists = callFilesystem("isfile", path)
+    if not checked then
+        return false, "Unable to inspect config: " .. tostring(exists)
+    end
+    if exists then
+        return false, "Config '" .. configName .. "' already exists"
+    end
+    return self:Save(configName)
+end
+
+function Configurations:Save(name)
+    local path, configName = self:_resolvePath(name)
+    if not path then
+        return false, configName
+    end
+    local available, availabilityError = requireFilesystemFunctions("writefile")
+    if not available then
+        return false, availabilityError
+    end
+    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    if not folderReady then
+        return false, folderError
+    end
+    local data, serializeError = self:_serialize()
+    if not data then
+        return false, serializeError
+    end
+    local written, writeError = callFilesystem("writefile", path, data)
+    if not written then
+        return false, "Unable to save config: " .. tostring(writeError)
+    end
+    return true, configName
+end
+
+function Configurations:Load(name)
+    local path, configName = self:_resolvePath(name)
+    if not path then
+        return false, configName
+    end
+    local available, availabilityError = requireFilesystemFunctions("isfile", "readfile")
+    if not available then
+        return false, availabilityError
+    end
+    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    if not folderReady then
+        return false, folderError
+    end
+    local checked, exists = callFilesystem("isfile", path)
+    if not checked then
+        return false, "Unable to inspect config: " .. tostring(exists)
+    end
+    if not exists then
+        return false, "Config '" .. configName .. "' does not exist"
+    end
+    local read, contents = callFilesystem("readfile", path)
+    if not read then
+        return false, "Unable to read config: " .. tostring(contents)
+    end
+    local decoded, decodeError = pcall(HttpService.JSONDecode, HttpService, contents)
+    if not decoded or type(decodeError) ~= "table" or type(decodeError.Values) ~= "table" then
+        return false, "Config '" .. configName .. "' is not valid JSON"
+    end
+
+    local preparedValues = {}
+    for flag, value in pairs(decodeError.Values) do
+        if type(flag) == "string" then
+            local deserialized, deserializeError = deserializeConfigValue(value)
+            if deserialized == nil and deserializeError then
+                return false, "Cannot load '" .. flag .. "': " .. tostring(deserializeError)
+            end
+            preparedValues[flag] = deserialized
+        end
+    end
+
+    local loaded = 0
+    for _, control in ipairs(self.Window._configControls) do
+        if control.SaveConfig ~= false and preparedValues[control.Flag] ~= nil then
+            local applied, applyError = pcall(control.SetValue, control, preparedValues[control.Flag])
+            if not applied then
+                return false, "Cannot apply '" .. control.Flag .. "': " .. tostring(applyError)
+            end
+            loaded = loaded + 1
+        end
+    end
+    return true, loaded
+end
+
+function Configurations:Delete(name)
+    local path, configName = self:_resolvePath(name)
+    if not path then
+        return false, configName
+    end
+    local available, availabilityError = requireFilesystemFunctions("isfile", "delfile")
+    if not available then
+        return false, availabilityError
+    end
+    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    if not folderReady then
+        return false, folderError
+    end
+    local checked, exists = callFilesystem("isfile", path)
+    if not checked then
+        return false, "Unable to inspect config: " .. tostring(exists)
+    end
+    if not exists then
+        return false, "Config '" .. configName .. "' does not exist"
+    end
+    local deleted, deleteError = callFilesystem("delfile", path)
+    if not deleted then
+        return false, "Unable to delete config: " .. tostring(deleteError)
+    end
+    return true, configName
+end
+
+Configurations.GetConfigs = Configurations.List
+
+function Window:ListConfigs()
+    return self.Configs:List()
+end
+
+function Window:CreateConfig(name)
+    return self.Configs:Create(name)
+end
+
+function Window:SaveConfig(name)
+    return self.Configs:Save(name)
+end
+
+function Window:LoadConfig(name)
+    return self.Configs:Load(name)
+end
+
+function Window:DeleteConfig(name)
+    return self.Configs:Delete(name)
+end
+
+Window.GetConfigs = Window.ListConfigs
 
 function Window:Destroy()
     for _, connection in ipairs(self._connections) do
@@ -2165,37 +3702,62 @@ end
 function Library:CreateWindow(options)
     options = normalizeOptions(options)
     local theme = mergeTheme(options.Accent, options.Theme)
-    local title = tostring(options.Title or options.Name or "Obsidian UI")
-    local subtitle = tostring(options.Subtitle or options.Description or "")
+    local language = normalizeLanguage(options.Language) or "en"
+    local titleSource = options.Title or options.Name or "Averlik UI"
+    local subtitleSource = options.Subtitle or options.Description or ""
+    local logoTextSource = options.LogoText or "O"
+    local footerSource = options.Footer or "Averlik UI"
+    local searchPlaceholderSource = options.SearchPlaceholder or { "Search...", "Поиск..." }
+    local restoreTextSource = options.RestoreText or { "Restore", "Восстановить" }
+    local title = localizedText(titleSource, language)
+    local subtitle = localizedText(subtitleSource, language)
     local mobile = isTouchDevice(options)
+    local animationsEnabled = options.Animations ~= false
+    local transparency = math.clamp(tonumber(options.Transparency) or WINDOW_VISIBLE_TRANSPARENCY, 0, 1)
     local size = typeof(options.Size) == "UDim2" and options.Size or UDim2.fromOffset(650, 430)
     local position = typeof(options.Position) == "UDim2" and options.Position or UDim2.fromScale(0.5, 0.5)
     local sidebarWidth = math.clamp(tonumber(options.SidebarWidth) or 161, 130, 220)
     local headerHeight = 62
+    local configFolder, configFolderError = normalizeConfigFolder(options.ConfigFolder)
+    assert(configFolder, configFolderError)
+    local configExtension, configExtensionError = normalizeConfigExtension(options.ConfigExtension)
+    assert(configExtension, configExtensionError)
     local parent, hostKind = getGuiParent(options.Parent, options.UseExecutorGui)
-    assert(parent, "Obsidian UI could not find a Gui parent")
+    assert(parent, "Averlik UI could not find a Gui parent")
 
     local screenGui = new("ScreenGui", {
-        Name = options.Id or "ObsidianUI",
+        Name = options.Id or "AverlikUI",
         DisplayOrder = tonumber(options.DisplayOrder) or 999,
         IgnoreGuiInset = true,
         ResetOnSpawn = false,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
         Parent = parent,
     })
+    -- Keep the main window and its notifications on a layer that can be
+    -- hidden without disabling ScreenGui. The floating session panel remains
+    -- interactive and can therefore restore a closed window.
+    local windowLayer = new("CanvasGroup", {
+        Name = "WindowLayer",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.fromScale(1, 1),
+        ZIndex = 1,
+        Parent = screenGui,
+    })
     -- CanvasGroup composites descendants before applying UICorner, so the
     -- sidebar/header cannot paint square pixels over the outer rounded edge.
     local root = new("CanvasGroup", {
         Name = "Window",
-        AnchorPoint = Vector2.new(0.5, 0.5),
+        AnchorPoint = Vector2.new(),
         BackgroundColor3 = theme.Background,
         BorderSizePixel = 0,
         ClipsDescendants = true,
-        GroupTransparency = 0.04,
-        Position = position,
+        GroupTransparency = animationsEnabled and WINDOW_HIDDEN_TRANSPARENCY or transparency,
+        Position = centeredWindowPosition(position, size),
         Size = size,
-        Parent = screenGui,
+        Parent = windowLayer,
     })
+    bindThemeColor(root, "BackgroundColor3", "Background")
     corner(root, 18)
     local sizeConstraint = new("UISizeConstraint", {
         MinSize = Vector2.new(460, 300),
@@ -2203,7 +3765,16 @@ function Library:CreateWindow(options)
         Parent = root,
     })
 
-    local shadow = uiShadow(root, theme.Shadow, 0.72, 14, UDim2.fromOffset(0, 4), UDim2.fromOffset(2, 2))
+    local shadow = uiShadow(
+        root,
+        theme.Shadow,
+        animationsEnabled and WINDOW_HIDDEN_TRANSPARENCY
+            or compositeTransparency(WINDOW_SHADOW_TRANSPARENCY, transparency),
+        14,
+        UDim2.fromOffset(0, 4),
+        UDim2.fromOffset(2, 2)
+    )
+    bindThemeColor(shadow, "Color", "Shadow")
     root.ZIndex = 1
 
     local sidebar = new("Frame", {
@@ -2214,7 +3785,8 @@ function Library:CreateWindow(options)
         ZIndex = 2,
         Parent = root,
     })
-    new("Frame", {
+    bindThemeColor(sidebar, "BackgroundColor3", "Sidebar")
+    local sidebarDivider = new("Frame", {
         BackgroundColor3 = theme.Border,
         BackgroundTransparency = 0.45,
         BorderSizePixel = 0,
@@ -2222,13 +3794,15 @@ function Library:CreateWindow(options)
         Size = UDim2.new(0, 1, 1, 0),
         Parent = sidebar,
     })
+    bindThemeColor(sidebarDivider, "BackgroundColor3", "Border")
     local brand = new("Frame", {
-        BackgroundColor3 = Color3.fromRGB(10, 10, 11),
+        BackgroundColor3 = theme.SidebarTop,
         BorderSizePixel = 0,
         Position = UDim2.fromOffset(10, 10),
         Size = UDim2.new(1, -20, 0, 43),
         Parent = sidebar,
     })
+    bindThemeColor(brand, "BackgroundColor3", "SidebarTop")
     corner(brand, 12)
     local sidebarDragHandle = new("Frame", {
         Name = "SidebarDragHandle",
@@ -2246,10 +3820,11 @@ function Library:CreateWindow(options)
         Size = UDim2.fromOffset(29, 29),
         Parent = brand,
     })
+    bindThemeColor(logo, "BackgroundColor3", "Accent")
     corner(logo, 8)
-    uiShadow(logo, theme.Accent, 0.46, 6, UDim2.new(), UDim2.fromOffset(1, 1))
-    text(logo, {
-        Text = options.LogoText or "O",
+    bindThemeColor(uiShadow(logo, theme.Accent, 0.46, 6, UDim2.new(), UDim2.fromOffset(1, 1)), "Color", "Accent")
+    local logoLabel = text(logo, {
+        Text = localizedText(logoTextSource, language),
         Font = Enum.Font.GothamBlack,
         TextSize = 16,
         TextXAlignment = Enum.TextXAlignment.Center,
@@ -2272,10 +3847,94 @@ function Library:CreateWindow(options)
         Size = UDim2.new(1, -49, 0, 14),
         Position = UDim2.fromOffset(43, 22),
     })
+    bindThemeColor(brandSubtitle, "TextColor3", "MutedText")
+
+    -- A compact duplicate of the brand area doubles as a persistent window
+    -- launcher. Its second line intentionally mirrors the footer statistics
+    -- instead of the brand subtitle.
+    local sessionPanelPosition = typeof(options.SessionPanelPosition) == "UDim2"
+        and options.SessionPanelPosition
+        or UDim2.fromOffset(18, 18)
+    local sessionPanel = new("CanvasGroup", {
+        Name = "SessionPanel",
+        Active = true,
+        BackgroundColor3 = theme.SidebarTop,
+        BorderSizePixel = 0,
+        Position = sessionPanelPosition,
+        Size = UDim2.fromOffset(141, 43),
+        ZIndex = 20,
+        Parent = screenGui,
+    })
+    bindThemeColor(sessionPanel, "BackgroundColor3", "SidebarTop")
+    corner(sessionPanel, 12)
+    local sessionPanelShadow = uiShadow(
+        sessionPanel,
+        theme.Shadow,
+        0.56,
+        8,
+        UDim2.fromOffset(0, 3),
+        UDim2.fromOffset(1, 1)
+    )
+    bindThemeColor(sessionPanelShadow, "Color", "Shadow")
+    local sessionPanelLogo = new("Frame", {
+        BackgroundColor3 = theme.Accent,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(7, 7),
+        Size = UDim2.fromOffset(29, 29),
+        ZIndex = 21,
+        Parent = sessionPanel,
+    })
+    bindThemeColor(sessionPanelLogo, "BackgroundColor3", "Accent")
+    corner(sessionPanelLogo, 8)
+    bindThemeColor(
+        uiShadow(sessionPanelLogo, theme.Accent, 0.46, 6, UDim2.new(), UDim2.fromOffset(1, 1)),
+        "Color",
+        "Accent"
+    )
+    local sessionPanelLogoLabel = text(sessionPanelLogo, {
+        Text = localizedText(logoTextSource, language),
+        Font = Enum.Font.GothamBlack,
+        TextSize = 16,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Size = UDim2.fromScale(1, 1),
+        TextColor3 = Color3.fromRGB(9, 9, 10),
+        ZIndex = 22,
+    })
+    local sessionPanelTitle = text(sessionPanel, {
+        Text = title,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Size = UDim2.new(1, -49, 0, 19),
+        Position = UDim2.fromOffset(43, 5),
+        ZIndex = 21,
+    })
+    local sessionPanelStats = text(sessionPanel, {
+        Name = "SessionStats",
+        Text = "0:00  •  0 fps",
+        Font = Enum.Font.GothamMedium,
+        TextColor3 = theme.MutedText,
+        TextSize = 9,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Size = UDim2.new(1, -49, 0, 14),
+        Position = UDim2.fromOffset(43, 22),
+        ZIndex = 21,
+    })
+    bindThemeColor(sessionPanelStats, "TextColor3", "MutedText")
+    -- The transparent handle sits above the labels so drags and clicks work
+    -- consistently across the whole panel, including its logo and text.
+    local sessionPanelHandle = button(sessionPanel, {
+        Name = "SessionPanelHandle",
+        Active = true,
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        Text = "",
+        ZIndex = 23,
+    })
 
     local navList = new("ScrollingFrame", {
         Name = "Navigation",
-        Active = true,
+        Active = mobile,
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -2283,30 +3942,48 @@ function Library:CreateWindow(options)
         Position = UDim2.fromOffset(10, 66),
         ScrollBarThickness = 0,
         ScrollingDirection = Enum.ScrollingDirection.Y,
-        Size = UDim2.new(1, -20, 1, -114),
+        Size = UDim2.new(1, -20, 1, -128),
         Parent = sidebar,
     })
     padding(navList, 0, 0, 0, 5)
     local navLayout = listLayout(navList, 4)
 
     local footer = new("Frame", {
-        BackgroundColor3 = Color3.fromRGB(10, 10, 11),
+        BackgroundColor3 = theme.SidebarBottom,
         BorderSizePixel = 0,
-        Position = UDim2.new(0, 10, 1, -50),
-        Size = UDim2.new(1, -20, 0, 40),
+        Position = UDim2.new(0, 10, 1, -55),
+        Size = UDim2.new(1, -20, 0, 46),
         Parent = sidebar,
     })
+    bindThemeColor(footer, "BackgroundColor3", "SidebarBottom")
     corner(footer, 12)
     local footerText = text(footer, {
-        Text = options.Footer or "Obsidian UI",
+        Text = localizedText(footerSource, language),
         Font = Enum.Font.GothamBold,
-        TextSize = 10,
+        TextSize = 13,
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
-        Size = UDim2.new(1, -16, 1, 0),
-        Position = UDim2.fromOffset(8, 0),
+        Size = UDim2.new(1, -16, 0, 23),
+        Position = UDim2.fromOffset(8, 4),
     })
-    uiShadow(footerText, theme.Text, 0.95, 17, UDim2.fromOffset(0, 1))
+    bindThemeColor(uiShadow(footerText, theme.Text, 0.95, 17, UDim2.fromOffset(0, 1)), "Color", "Text")
+    local footerStats = text(footer, {
+        Name = "SessionStats",
+        Text = "0:00  •  0 fps",
+        Font = Enum.Font.GothamMedium,
+        TextColor3 = theme.MutedText,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Size = UDim2.new(1, -16, 0, 16),
+        Position = UDim2.fromOffset(8, 24),
+    })
+    bindThemeColor(footerStats, "TextColor3", "MutedText")
+    local footerButton = button(footer, {
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        Text = "",
+        ZIndex = 2,
+    })
 
     local main = new("Frame", {
         Name = "Main",
@@ -2317,6 +3994,7 @@ function Library:CreateWindow(options)
         ZIndex = 2,
         Parent = root,
     })
+    bindThemeColor(main, "BackgroundColor3", "Background")
     local header = new("Frame", {
         Name = "Header",
         BackgroundColor3 = theme.Header,
@@ -2324,7 +4002,8 @@ function Library:CreateWindow(options)
         Size = UDim2.new(1, 0, 0, headerHeight),
         Parent = main,
     })
-    new("Frame", {
+    bindThemeColor(header, "BackgroundColor3", "Header")
+    local headerDivider = new("Frame", {
         BackgroundColor3 = theme.Border,
         BackgroundTransparency = 0.48,
         BorderSizePixel = 0,
@@ -2332,6 +4011,7 @@ function Library:CreateWindow(options)
         Size = UDim2.new(1, 0, 0, 1),
         Parent = header,
     })
+    bindThemeColor(headerDivider, "BackgroundColor3", "Border")
     local pageTitleBounds = new("Frame", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -2346,7 +4026,11 @@ function Library:CreateWindow(options)
         AutomaticSize = Enum.AutomaticSize.X,
         Size = UDim2.new(0, 0, 1, 0),
     })
-    uiShadow(pageTitle, theme.Text, 0.86, 25, UDim2.fromOffset(0, 1),UDim2.new(0.5,0,0,0))
+    bindThemeColor(
+        uiShadow(pageTitle, theme.Text, 0.86, 25, UDim2.fromOffset(0, 1), UDim2.new(0.5, 0, 0, 0)),
+        "Color",
+        "Text"
+    )
     local pageSubtitle = text(header, {
         Text = subtitle,
         TextSize = 9,
@@ -2356,8 +4040,9 @@ function Library:CreateWindow(options)
         Position = UDim2.fromOffset(14, 34),
         Visible = subtitle ~= "",
     })
+    bindThemeColor(pageSubtitle, "TextColor3", "MutedText")
     local search = new("Frame", {
-        BackgroundColor3 = Color3.fromRGB(20, 20, 21),
+        BackgroundColor3 = theme.Search,
         BorderSizePixel = 0,
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, options.CanExit == false and -12 or -50, 0.5, 0),
@@ -2366,6 +4051,7 @@ function Library:CreateWindow(options)
         ZIndex = 3,
         Parent = header,
     })
+    bindThemeColor(search, "BackgroundColor3", "Search")
     corner(search, 10)
     local searchBox = new("TextBox", {
         BackgroundTransparency = 1,
@@ -2373,7 +4059,7 @@ function Library:CreateWindow(options)
         ClearTextOnFocus = false,
         Font = Enum.Font.Gotham,
         PlaceholderColor3 = theme.SubtleText,
-        PlaceholderText = options.SearchPlaceholder or "Search...",
+        PlaceholderText = localizedText(searchPlaceholderSource, language),
         Size = UDim2.new(1, -20, 1, 0),
         Position = UDim2.fromOffset(10, 0),
         Text = "",
@@ -2383,20 +4069,58 @@ function Library:CreateWindow(options)
         ZIndex = 4,
         Parent = search,
     })
+    bindThemeColor(searchBox, "PlaceholderColor3", "SubtleText")
+    bindThemeColor(searchBox, "TextColor3", "Text")
     local close = button(header, {
-        BackgroundColor3 = Color3.fromRGB(25, 25, 26),
+        BackgroundColor3 = theme.CloseButton,
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -10, 0.5, 0),
         Size = UDim2.fromOffset(35, 35),
-        Text = "×",
-        TextSize = 22,
+        Text = "",
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
         Visible = options.CanExit ~= false,
         ZIndex = 3,
     })
+    bindThemeColor(close, "BackgroundColor3", "CloseButton")
     corner(close, 10)
-    addHover(close, theme, Color3.fromRGB(25, 25, 26), Color3.fromRGB(44, 44, 46))
+    local closeIcon = text(close, {
+        Name = "CloseIcon",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(27, 27),
+        Text = "×",
+        TextColor3 = theme.Text,
+        TextSize = 27,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        ZIndex = 4,
+    })
+    bindThemeColor(closeIcon, "TextColor3", "Text")
+    corner(closeIcon, 14)
+    bindThemeColor(uiShadow(closeIcon, closeIcon.TextColor3, 0.92, 11, UDim2.new(), UDim2.fromOffset(0, 0)), "Color", "Text")
+    local refreshCloseHover = addHover(
+        close,
+        theme,
+        function(currentTheme)
+            return currentTheme.CloseButton
+        end,
+        function(currentTheme)
+            return currentTheme.CloseButton:Lerp(Color3.fromRGB(255, 255, 255), 0.08)
+        end
+    )
+    close.MouseEnter:Connect(function()
+        tween(closeIcon, 0.12, {
+            Size = UDim2.fromOffset(29, 29),
+            TextSize = 29,
+        })
+    end)
+    close.MouseLeave:Connect(function()
+        tween(closeIcon, 0.12, {
+            Size = UDim2.fromOffset(27, 27),
+            TextSize = 27,
+        })
+    end)
     local minimize = button(header, {
         BackgroundTransparency = 1,
         AnchorPoint = Vector2.new(1, 0.5),
@@ -2409,6 +4133,7 @@ function Library:CreateWindow(options)
         Visible = options.CanMinimize == true,
         ZIndex = 3,
     })
+    bindThemeColor(minimize, "TextColor3", "MutedText")
 
     local pages = new("Frame", {
         Name = "Pages",
@@ -2426,7 +4151,7 @@ function Library:CreateWindow(options)
         Position = UDim2.new(1, 0, 0, 18),
         Size = UDim2.fromOffset(300, 600),
         ZIndex = 10,
-        Parent = screenGui,
+        Parent = windowLayer,
     })
     local dragHandle = new("Frame", {
         Name = "DragHandle",
@@ -2459,6 +4184,7 @@ function Library:CreateWindow(options)
         ZIndex = 6,
         Parent = root,
     })
+    bindThemeColor(restoreBar, "BackgroundColor3", "Header")
     local restoreTitle = text(restoreBar, {
         Text = title,
         Font = Enum.Font.GothamBold,
@@ -2472,26 +4198,41 @@ function Library:CreateWindow(options)
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -8, 0.5, 0),
         Size = UDim2.fromOffset(70, 25),
-        Text = "Restore",
+        Text = localizedText(restoreTextSource, language),
         TextSize = 9,
         TextXAlignment = Enum.TextXAlignment.Center,
         ZIndex = 7,
     })
+    bindThemeColor(restoreButton, "BackgroundColor3", "Surface")
     corner(restoreButton, 6)
 
     local window = setmetatable({
         Type = "Window",
+        _theme = theme,
         Theme = theme,
+        Language = language,
+        _titleSource = titleSource,
+        _subtitleSource = subtitleSource,
+        _logoTextSource = logoTextSource,
+        _footerSource = footerSource,
+        _searchPlaceholderSource = searchPlaceholderSource,
+        _restoreTextSource = restoreTextSource,
         Title = title,
         Subtitle = subtitle,
+        Position = position,
+        Transparency = transparency,
         Visible = true,
         Minimized = false,
         IsMobile = mobile,
+        AnimationsEnabled = animationsEnabled,
         HostKind = hostKind,
         Runtime = Runtime:GetInfo(),
         Root = root,
         ScreenGui = screenGui,
+        WindowLayer = windowLayer,
+        _restingGroupTransparency = transparency,
         Shadow = shadow,
+        _shadowBaseTransparency = WINDOW_SHADOW_TRANSPARENCY,
         SizeConstraint = sizeConstraint,
         Sidebar = sidebar,
         Main = main,
@@ -2501,18 +4242,50 @@ function Library:CreateWindow(options)
         Pages = pages,
         BrandTitle = brandTitle,
         BrandSubtitle = brandSubtitle,
+        LogoLabel = logoLabel,
+        SessionPanel = sessionPanel,
+        SessionPanelTitle = sessionPanelTitle,
+        SessionPanelStats = sessionPanelStats,
+        SessionPanelLogoLabel = sessionPanelLogoLabel,
+        SessionPanelHandle = sessionPanelHandle,
+        SessionPanelPosition = sessionPanelPosition,
+        FooterText = footerText,
+        FooterStats = footerStats,
+        FooterButton = footerButton,
         PageTitle = pageTitle,
         PageSubtitle = pageSubtitle,
         SearchBox = searchBox,
         Notifications = notificationLayer,
         RestoreBar = restoreBar,
         RestoreTitle = restoreTitle,
+        RestoreButton = restoreButton,
+        _refreshChromeTheme = refreshCloseHover,
         Tabs = {},
         SelectedTab = nil,
         _notifications = {},
         _connections = {},
+        _entranceTweens = {},
+        _visibilityTweens = {},
+        _contentTweens = {},
+        _visibilityToken = 0,
         _expandedSize = size,
+        ToggleKey = nil,
+        ConfigFolder = configFolder,
+        ConfigExtension = configExtension,
+        _configControls = {},
+        _configControlsByFlag = {},
+        _footerCallback = options.FooterCallback or options.DiscordCallback or options.FooterPressed,
     }, Window)
+    window.Theme = createThemeProxy(window, theme)
+    window.Configs = setmetatable({
+        Window = window,
+        Folder = configFolder,
+        Extension = configExtension,
+    }, Configurations)
+    window.Config = window.Configs
+    -- text() and button() keep their default text colour as an explicit theme
+    -- binding, so custom themes apply without relying on colour equality.
+    window:_refreshThemeBindings()
 
     window:_track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
         window:Search(searchBox.Text)
@@ -2526,18 +4299,87 @@ function Library:CreateWindow(options)
     window:_track(restoreButton.Activated:Connect(function()
         window:Minimize(false)
     end))
+    window:_track(footerButton.Activated:Connect(function()
+        safeCall(window._footerCallback, window)
+    end))
+    do
+        local sessionStartedAt = os.clock()
+        local displayedSessionSecond = 0
+        local fpsSampleStartedAt = sessionStartedAt
+        local frameCount = 0
+
+        window:_track(RunService.RenderStepped:Connect(function()
+            frameCount = frameCount + 1
+        end))
+        window:_track(RunService.Heartbeat:Connect(function()
+            local now = os.clock()
+            local sessionSeconds = math.floor(now - sessionStartedAt)
+            if sessionSeconds == displayedSessionSecond then
+                return
+            end
+
+            local sampleDuration = math.max(now - fpsSampleStartedAt, 0.001)
+            local fps = math.floor(frameCount / sampleDuration + 0.5)
+            local statsText = string.format(
+                "%s  •  %d fps",
+                formatSessionDuration(sessionSeconds),
+                fps
+            )
+            window.FooterStats.Text = statsText
+            window.SessionPanelStats.Text = statsText
+            displayedSessionSecond = sessionSeconds
+            fpsSampleStartedAt = now
+            frameCount = 0
+        end))
+    end
+
+    do
+        local dragStart
+        local startPosition
+        local moved = false
+        trackPointerDrag(window, sessionPanelHandle, function(input)
+            dragStart = input.Position
+            startPosition = sessionPanel.Position
+            moved = false
+        end, function(input)
+            local delta = input.Position - dragStart
+            if delta.Magnitude >= 5 then
+                moved = true
+            end
+            local nextPosition = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+            sessionPanel.Position = nextPosition
+            window.SessionPanelPosition = nextPosition
+        end, function()
+            if not moved then
+                window:Toggle()
+            end
+        end)
+    end
 
     if options.Draggable ~= false then
         local dragStart
         local startPosition
+        local startWindowPosition
         local function beginDrag(input)
             dragStart = input.Position
             startPosition = root.Position
+            startWindowPosition = window.Position
         end
         local function moveDrag(input)
             local delta = input.Position - dragStart
             local nextPosition = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
             root.Position = nextPosition
+            window.Position = UDim2.new(
+                startWindowPosition.X.Scale,
+                startWindowPosition.X.Offset + delta.X,
+                startWindowPosition.Y.Scale,
+                startWindowPosition.Y.Offset + delta.Y
+            )
         end
         trackPointerDrag(window, dragHandle, beginDrag, moveDrag)
         trackPointerDrag(window, sidebarDragHandle, beginDrag, moveDrag)
@@ -2545,31 +4387,53 @@ function Library:CreateWindow(options)
     if options.Resizable == true then
         local resizeStart
         local startSize
+        local startPosition
+        local startWindowPosition
         trackPointerDrag(window, resizeHandle, function(input)
             resizeStart = input.Position
             startSize = root.AbsoluteSize
+            startPosition = root.Position
+            startWindowPosition = window.Position
         end, function(input)
             local delta = input.Position - resizeStart
             local nextWidth = math.clamp(startSize.X + delta.X, 460, 1100)
             local nextHeight = math.clamp(startSize.Y + delta.Y, 300, 820)
             local nextSize = UDim2.fromOffset(nextWidth, nextHeight)
             root.Size = nextSize
+            -- Root is top-left anchored, so the CanvasGroup itself never
+            -- moves while resizing and its contents remain pixel-stable.
+            local appliedDelta = Vector2.new(nextWidth - startSize.X, nextHeight - startSize.Y)
+            root.Position = startPosition
+            window.Position = UDim2.new(
+                startWindowPosition.X.Scale,
+                startWindowPosition.X.Offset + appliedDelta.X / 2,
+                startWindowPosition.Y.Scale,
+                startWindowPosition.Y.Offset + appliedDelta.Y / 2
+            )
             window._expandedSize = nextSize
         end)
     end
-    local toggleKey = options.ToggleKey
-    if type(toggleKey) == "string" then
-        toggleKey = Enum.KeyCode[toggleKey]
-    end
-    if typeof(toggleKey) == "EnumItem" then
-        window:_track(UserInputService.InputBegan:Connect(function(input, processed)
-            if not processed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == toggleKey then
-                window:Toggle()
-            end
-        end))
-    end
+    window:SetToggleKey(options.ToggleKey)
+    window:_track(UserInputService.InputBegan:Connect(function(input, processed)
+        if not processed and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == window.ToggleKey then
+            window:Toggle()
+        end
+    end))
     table.insert(Library.Windows, window)
     Library._lastWindow = window
+    if window.AnimationsEnabled then
+        window._entranceTweens = {
+            tween(root, WINDOW_TRANSITION_DURATION, {
+                GroupTransparency = window._restingGroupTransparency,
+            }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+            tween(shadow, WINDOW_TRANSITION_DURATION, {
+                Transparency = compositeTransparency(
+                    window._shadowBaseTransparency,
+                    window._restingGroupTransparency
+                ),
+            }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+        }
+    end
     return window
 end
 
@@ -2596,7 +4460,7 @@ function Library:Notify(options)
     if self._lastWindow then
         return self._lastWindow:Notify(options)
     end
-    warn("[Obsidian UI] Create a window before sending a notification")
+    warn("[Averlik UI] Create a window before sending a notification")
     return nil
 end
 
@@ -2605,6 +4469,54 @@ function Library:Destroy()
         self.Windows[index]:Destroy()
     end
     self._lastWindow = nil
+end
+
+-- Unlike Destroy, Unload gives every live window a final fade without resizing
+-- it. The optional callback is called after that fade and before Instances and
+-- tracked event connections are destroyed.
+function Library:Unload(callback)
+    assert(callback == nil or type(callback) == "function", "Unload expects a function or nil")
+    if self._unloading then
+        return self
+    end
+    self._unloading = true
+
+    local windows = {}
+    for _, window in ipairs(self.Windows) do
+        table.insert(windows, window)
+    end
+    local remaining = #windows
+    local function finish()
+        if not self._unloading then
+            return
+        end
+        if callback then
+            local completed, unloadError = pcall(callback)
+            if not completed then
+                warn("[Averlik UI] unload callback error: " .. tostring(unloadError))
+            end
+        end
+        self:Destroy()
+        self._unloading = false
+    end
+
+    if remaining == 0 then
+        finish()
+        return self
+    end
+
+    local function windowFinished()
+        remaining = remaining - 1
+        if remaining == 0 then
+            finish()
+        end
+    end
+    for _, window in ipairs(windows) do
+        if not window:_playUnloadAnimation(windowFinished) then
+            windowFinished()
+        end
+    end
+    return self
 end
 
 Library.Themes = {
@@ -2617,6 +4529,11 @@ Library.Accents = {
     Purple = Color3.fromRGB(189, 115, 255),
     Red = Color3.fromRGB(255, 103, 125),
     Orange = Color3.fromRGB(255, 169, 62),
+}
+
+Library.Languages = {
+    English = "en",
+    Russian = "ru",
 }
 
 Section.Label = Section.AddLabel
