@@ -1,19 +1,8 @@
---[[
-    Averlik UI
-    A standalone retained-mode UI library for Luau / Roblox clients.
 
-    Quick start:
-        local UI = require(path.to.Library)
-        local Window = UI:CreateWindow({ Title = "My Hub", Subtitle = "v1.0" })
-        local Tab = Window:Tab({ Name = "Main", Icon = 1234567890, Select = true })
-        local Section = Tab:Section({ Title = "General" })
-        Section:AddToggle({ Name = "Enabled", Default = true, Callback = print })
-
-    Executor runtime support is intentionally limited to selecting a GUI host
-    through the UNC-compatible gethui() API and persistent UI configurations
-    through the UNC filesystem API. The library contains no hooks, input
-    simulation, game automation, networking, or other executor features.
-]]
+local Assets = {
+    ["logo.jpg"] = "nil",
+	["close.png"] = "nil",
+}
 
 local Library = {
     Version = "1.5.0",
@@ -38,6 +27,21 @@ local function isTouchDevice(options)
         return options.Mobile == true
     end
     return UserInputService.TouchEnabled
+end
+
+if not isfolder("Averlik Hub") then
+    makefolder("Averlik Hub")
+end
+if not isfolder("Averlik Hub/Assets") then
+    makefolder("Averlik Hub/Assets")
+end
+
+for name,_ in pairs(Assets) do
+    if not isfile("Averlik Hub/Assets/"..name) then
+        writefile("Averlik Hub/Assets/"..name,game:HttpGet("https://github.com/Tarmaster/Library/blob/main/assets/"..name.."?raw=true"))
+        task.wait(0.05)
+    end
+    Assets[name] = getcustomasset("Averlik Hub/Assets/"..name)
 end
 
 -- Keeps a drag bound to the input object that began it.  This is important on
@@ -1165,12 +1169,27 @@ function Section:AddToggle(options)
     end
     value = value == true
 
+    -- A toggle can optionally own a compact keybind button.  Accepting both a
+    -- short value and a table keeps simple declarations compact while leaving
+    -- room for the bind-change callback.
+    local keybindOptions = type(options.Keybind) == "table" and options.Keybind or {}
+    local toggleKey = resolveKeyCode(
+        keybindOptions.Default
+            or keybindOptions.Value
+            or keybindOptions.Key
+            or options.Keybind
+            or options.Bind
+            or options.Key
+    )
+    local hasKeybind = toggleKey ~= nil
+    local textRightInset = hasKeybind and 132 or 66
+
     local frame = self:_row(description ~= "" and 55 or 37)
     local titleLabel = text(frame, {
         Text = title,
         Font = Enum.Font.GothamMedium,
         TextSize = 12,
-        Size = UDim2.new(1, -66, description ~= "" and 0 or 1, description ~= "" and 22 or 0),
+        Size = UDim2.new(1, -textRightInset, description ~= "" and 0 or 1, description ~= "" and 22 or 0),
         Position = UDim2.fromOffset(10, description ~= "" and 8 or 0),
     })
     local descriptionLabel = nil
@@ -1179,7 +1198,7 @@ function Section:AddToggle(options)
             Text = description,
             TextSize = 10,
             TextColor3 = self.Window.Theme.MutedText,
-            Size = UDim2.new(1, -66, 0, 17),
+            Size = UDim2.new(1, -textRightInset, 0, 17),
             Position = UDim2.fromOffset(10, 29),
         })
         bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
@@ -1212,6 +1231,133 @@ function Section:AddToggle(options)
         end
         return self
     end
+
+    if hasKeybind then
+        local bind = button(frame, {
+            Name = "Keybind",
+            BackgroundColor3 = Color3.fromRGB(20, 20, 21),
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -55, 0.5, 0),
+            Size = UDim2.fromOffset(58, 22),
+            Text = toggleKey.Name,
+            TextSize = 9,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            ZIndex = 3,
+        })
+        corner(bind, 5)
+        bindThemeColor(stroke(bind, self.Window.Theme.Border, 1, 0.45), "Color", "Border")
+        local bindGlow = uiShadow(bind, self.Window.Theme.Accent, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
+        bindThemeColor(bindGlow, "Color", "Accent")
+        bindGlow.Enabled = false
+
+        control.Key = toggleKey
+        control._bindChangedCallbacks = {}
+        local bindChanged = keybindOptions.BindChanged
+            or keybindOptions.ChangedCallback
+            or keybindOptions.OnBindChanged
+            or options.BindChanged
+            or options.ChangedCallback
+            or options.OnBindChanged
+        if type(bindChanged) == "function" then
+            table.insert(control._bindChangedCallbacks, bindChanged)
+        end
+
+        local listening = false
+        local function refreshBindAppearance(instant)
+            if listening then
+                bind.Text = "..."
+                bind.TextColor3 = Color3.fromRGB(10, 10, 10)
+                bindGlow.Color = control.Section.Window.Theme.Accent
+                bindGlow.Enabled = true
+                if instant then
+                    bind.BackgroundColor3 = control.Section.Window.Theme.Accent
+                else
+                    tween(bind, 0.12, { BackgroundColor3 = control.Section.Window.Theme.Accent })
+                end
+            else
+                bind.Text = control.Key.Name
+                bind.TextColor3 = control.Section.Window.Theme.Text
+                bindGlow.Enabled = false
+                if instant then
+                    bind.BackgroundColor3 = Color3.fromRGB(20, 20, 21)
+                else
+                    tween(bind, 0.12, { BackgroundColor3 = Color3.fromRGB(20, 20, 21) })
+                end
+            end
+        end
+
+        local previousRefreshTheme = control._refreshTheme
+        control._refreshTheme = function()
+            previousRefreshTheme()
+            refreshBindAppearance(true)
+        end
+        function control:_emitBindChanged(nextKey)
+            for _, callback in ipairs(self._bindChangedCallbacks) do
+                safeCall(callback, nextKey)
+            end
+        end
+        function control:OnBindChanged(callback)
+            assert(type(callback) == "function", "OnBindChanged expects a function")
+            table.insert(self._bindChangedCallbacks, callback)
+            return self
+        end
+        function control:GetKey()
+            return self.Key
+        end
+        function control:SetKey(nextKey, silent)
+            nextKey = resolveKeyCode(nextKey)
+            if not nextKey then
+                return self
+            end
+            if self.Key == nextKey then
+                refreshBindAppearance(true)
+                return self
+            end
+            self.Key = nextKey
+            refreshBindAppearance(true)
+            if not silent then
+                self:_emitBindChanged(nextKey)
+            end
+            return self
+        end
+        control._getConfigValue = function()
+            return {
+                Value = control.Value,
+                Key = control.Key,
+            }
+        end
+        control._setConfigValue = function(_, nextValue)
+            if type(nextValue) == "table" then
+                control:SetValue(nextValue.Value)
+                control:SetKey(nextValue.Key)
+                return control
+            end
+            -- Older configs stored only the toggle state.  Preserve that
+            -- state and keep the key supplied by the current script.
+            return control:SetValue(nextValue)
+        end
+        control:_track(bind.Activated:Connect(function()
+            listening = not listening
+            refreshBindAppearance(false)
+        end))
+        control:_track(UserInputService.InputBegan:Connect(function(input, processed)
+            if processed then
+                return
+            end
+            if listening then
+                if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+                    listening = false
+                    refreshBindAppearance(false)
+                    control:SetKey(input.KeyCode)
+                end
+                return
+            end
+            if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == control.Key then
+                control:SetValue(not control.Value)
+            end
+        end))
+    end
+
     local hitbox = button(frame, {
         BackgroundTransparency = 1,
         Size = UDim2.fromScale(1, 1),
@@ -1981,6 +2127,17 @@ function Section:AddKeybind(options)
         table.insert(self._bindChangedCallbacks, callback)
         return self
     end
+    function control:GetKey()
+        return self.Key
+    end
+
+    local function stopListening()
+        listening = false
+        bind.Text = control.Key.Name
+        bind.TextColor3 = control.Section.Window.Theme.Text
+        tween(bind, 0.12, { BackgroundColor3 = Color3.fromRGB(20, 20, 21) })
+        bindGlow.Enabled = false
+    end
 
     local function setKey(nextKey, silent, notifyBindChanged)
         nextKey = resolveKeyCode(nextKey)
@@ -2011,6 +2168,12 @@ function Section:AddKeybind(options)
         return setKey(nextKey, silent, not silent)
     end
     control:_track(bind.Activated:Connect(function()
+        -- A second click is an explicit cancel: retain the current key and
+        -- restore its caption instead of waiting for another keyboard input.
+        if listening then
+            stopListening()
+            return
+        end
         listening = true
         bind.Text = "..."
         tween(bind, 0.12, { BackgroundColor3 = self.Window.Theme.Accent })
@@ -2024,10 +2187,7 @@ function Section:AddKeybind(options)
         end
         if listening then
             if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
-                listening = false
-                bind.TextColor3 = self.Window.Theme.Text
-                tween(bind, 0.12, { BackgroundColor3 = Color3.fromRGB(20, 20, 21) })
-                bindGlow.Enabled = false
+                stopListening()
                 setKey(input.KeyCode, true, true)
             end
             return
@@ -2530,12 +2690,6 @@ function Window:_refreshLocalization()
     self.RestoreTitle.Text = self.Title
     self.FooterText.Text = self:_resolveLocalizedText(self._footerSource)
     self.SearchBox.PlaceholderText = self:_resolveLocalizedText(self._searchPlaceholderSource)
-    if self.LogoLabel then
-        self.LogoLabel.Text = self:_resolveLocalizedText(self._logoTextSource)
-    end
-    if self.SessionPanelLogoLabel then
-        self.SessionPanelLogoLabel.Text = self:_resolveLocalizedText(self._logoTextSource)
-    end
     if self.RestoreButton then
         self.RestoreButton.Text = self:_resolveLocalizedText(self._restoreTextSource)
     end
@@ -3474,7 +3628,7 @@ function Configurations:_serialize()
     local values = {}
     for _, control in ipairs(self.Window._configControls) do
         if control.SaveConfig ~= false then
-            local value = control:GetValue()
+            local value = control._getConfigValue and control:_getConfigValue() or control:GetValue()
             if value ~= nil then
                 local serialized, serializeError = serializeConfigValue(value)
                 if serialized == nil then
@@ -3617,7 +3771,8 @@ function Configurations:Load(name)
     local loaded = 0
     for _, control in ipairs(self.Window._configControls) do
         if control.SaveConfig ~= false and preparedValues[control.Flag] ~= nil then
-            local applied, applyError = pcall(control.SetValue, control, preparedValues[control.Flag])
+            local applyValue = control._setConfigValue or control.SetValue
+            local applied, applyError = pcall(applyValue, control, preparedValues[control.Flag])
             if not applied then
                 return false, "Cannot apply '" .. control.Flag .. "': " .. tostring(applyError)
             end
@@ -3678,7 +3833,25 @@ end
 
 Window.GetConfigs = Window.ListConfigs
 
+function Window:_fireOnUnload()
+    if self._onUnloadFired then
+        return
+    end
+    self._onUnloadFired = true
+    if type(self.OnUnload) == "function" then
+        local completed, unloadError = pcall(self.OnUnload, self)
+        if not completed then
+            warn("[Averlik UI] OnUnload callback error: " .. tostring(unloadError))
+        end
+    end
+end
+
 function Window:Destroy()
+    if self._destroyed then
+        return
+    end
+    self._destroyed = true
+    self:_fireOnUnload()
     for _, connection in ipairs(self._connections) do
         connection:Disconnect()
     end
@@ -3701,11 +3874,23 @@ end
 
 function Library:CreateWindow(options)
     options = normalizeOptions(options)
+    assert(options.OnUnload == nil or type(options.OnUnload) == "function", "OnUnload expects a function or nil")
+
+    -- A library instance owns one active interface at a time. Tear down every
+    -- previous window before constructing the next one so stale ScreenGuis,
+    -- connections, and floating session panels cannot overlap the new UI.
+    if #Library.Windows > 0 then
+        -- Cancel an in-progress animated unload: its delayed completion must
+        -- not destroy the window that is about to be created.
+        Library._unloading = false
+        Library:Destroy()
+    end
+
     local theme = mergeTheme(options.Accent, options.Theme)
     local language = normalizeLanguage(options.Language) or "en"
     local titleSource = options.Title or options.Name or "Averlik UI"
     local subtitleSource = options.Subtitle or options.Description or ""
-    local logoTextSource = options.LogoText or "O"
+    local image = tostring(options.Image or "")
     local footerSource = options.Footer or "Averlik UI"
     local searchPlaceholderSource = options.SearchPlaceholder or { "Search...", "Поиск..." }
     local restoreTextSource = options.RestoreText or { "Restore", "Восстановить" }
@@ -3813,24 +3998,15 @@ function Library:CreateWindow(options)
         ZIndex = 4,
         Parent = sidebar,
     })
-    local logo = new("Frame", {
-        BackgroundColor3 = theme.Accent,
+    local logo = new("ImageLabel", {
+        BackgroundTransparency = 1,
         BorderSizePixel = 0,
+        Image = image,
         Position = UDim2.fromOffset(7, 7),
         Size = UDim2.fromOffset(29, 29),
         Parent = brand,
     })
-    bindThemeColor(logo, "BackgroundColor3", "Accent")
     corner(logo, 8)
-    bindThemeColor(uiShadow(logo, theme.Accent, 0.46, 6, UDim2.new(), UDim2.fromOffset(1, 1)), "Color", "Accent")
-    local logoLabel = text(logo, {
-        Text = localizedText(logoTextSource, language),
-        Font = Enum.Font.GothamBlack,
-        TextSize = 16,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        TextColor3 = Color3.fromRGB(9, 9, 10),
-        Size = UDim2.fromScale(1, 1),
-    })
     local brandTitle = text(brand, {
         Text = title,
         Font = Enum.Font.GothamBold,
@@ -3876,30 +4052,16 @@ function Library:CreateWindow(options)
         UDim2.fromOffset(1, 1)
     )
     bindThemeColor(sessionPanelShadow, "Color", "Shadow")
-    local sessionPanelLogo = new("Frame", {
-        BackgroundColor3 = theme.Accent,
+    local sessionPanelLogo = new("ImageLabel", {
+        BackgroundTransparency = 1,
         BorderSizePixel = 0,
+        Image = image,
         Position = UDim2.fromOffset(7, 7),
         Size = UDim2.fromOffset(29, 29),
         ZIndex = 21,
         Parent = sessionPanel,
     })
-    bindThemeColor(sessionPanelLogo, "BackgroundColor3", "Accent")
     corner(sessionPanelLogo, 8)
-    bindThemeColor(
-        uiShadow(sessionPanelLogo, theme.Accent, 0.46, 6, UDim2.new(), UDim2.fromOffset(1, 1)),
-        "Color",
-        "Accent"
-    )
-    local sessionPanelLogoLabel = text(sessionPanelLogo, {
-        Text = localizedText(logoTextSource, language),
-        Font = Enum.Font.GothamBlack,
-        TextSize = 16,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        Size = UDim2.fromScale(1, 1),
-        TextColor3 = Color3.fromRGB(9, 9, 10),
-        ZIndex = 22,
-    })
     local sessionPanelTitle = text(sessionPanel, {
         Text = title,
         Font = Enum.Font.GothamBold,
@@ -4084,21 +4246,22 @@ function Library:CreateWindow(options)
     })
     bindThemeColor(close, "BackgroundColor3", "CloseButton")
     corner(close, 10)
-    local closeIcon = text(close, {
+    local closeIcon = new("ImageLabel", {
         Name = "CloseIcon",
         AnchorPoint = Vector2.new(0.5, 0.5),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Image = Assets["close.png"] or "",
+        ImageColor3 = theme.Text,
         Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromOffset(27, 27),
-        Text = "×",
-        TextColor3 = theme.Text,
-        TextSize = 27,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        TextYAlignment = Enum.TextYAlignment.Center,
+        ScaleType = Enum.ScaleType.Fit,
+        Size = UDim2.fromOffset(18, 18),
         ZIndex = 4,
+        Parent = close,
     })
-    bindThemeColor(closeIcon, "TextColor3", "Text")
+    bindThemeColor(closeIcon, "ImageColor3", "Text")
     corner(closeIcon, 14)
-    bindThemeColor(uiShadow(closeIcon, closeIcon.TextColor3, 0.92, 11, UDim2.new(), UDim2.fromOffset(0, 0)), "Color", "Text")
+    bindThemeColor(uiShadow(closeIcon, closeIcon.ImageColor3, 0.92, 11, UDim2.new(), UDim2.fromOffset(0, 0)), "Color", "Text")
     local refreshCloseHover = addHover(
         close,
         theme,
@@ -4111,14 +4274,14 @@ function Library:CreateWindow(options)
     )
     close.MouseEnter:Connect(function()
         tween(closeIcon, 0.12, {
-            Size = UDim2.fromOffset(29, 29),
-            TextSize = 29,
+            Size = UDim2.fromOffset(19, 19),
+            ImageColor3 = theme.Text:Lerp(Color3.fromRGB(255, 255, 255), 0.18),
         })
     end)
     close.MouseLeave:Connect(function()
         tween(closeIcon, 0.12, {
-            Size = UDim2.fromOffset(27, 27),
-            TextSize = 27,
+            Size = UDim2.fromOffset(18, 18),
+            ImageColor3 = theme.Text,
         })
     end)
     local minimize = button(header, {
@@ -4213,7 +4376,9 @@ function Library:CreateWindow(options)
         Language = language,
         _titleSource = titleSource,
         _subtitleSource = subtitleSource,
-        _logoTextSource = logoTextSource,
+        OnUnload = options.OnUnload,
+        _onUnloadFired = false,
+        Image = image,
         _footerSource = footerSource,
         _searchPlaceholderSource = searchPlaceholderSource,
         _restoreTextSource = restoreTextSource,
@@ -4242,11 +4407,11 @@ function Library:CreateWindow(options)
         Pages = pages,
         BrandTitle = brandTitle,
         BrandSubtitle = brandSubtitle,
-        LogoLabel = logoLabel,
+        LogoImage = logo,
         SessionPanel = sessionPanel,
         SessionPanelTitle = sessionPanelTitle,
         SessionPanelStats = sessionPanelStats,
-        SessionPanelLogoLabel = sessionPanelLogoLabel,
+        SessionPanelLogoImage = sessionPanelLogo,
         SessionPanelHandle = sessionPanelHandle,
         SessionPanelPosition = sessionPanelPosition,
         FooterText = footerText,
