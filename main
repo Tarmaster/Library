@@ -1,4 +1,23 @@
+--[[
+    Averlik UI
+    A standalone retained-mode UI library for Luau / Roblox clients.
 
+    Quick start:
+        local UI = require(path.to.Library)
+        local Window = UI:CreateWindow({
+            Title = "My Hub",
+            Subtitle = "v1.0",
+            Image = "rbxassetid://136486945503309",
+        })
+        local Tab = Window:Tab({ Name = "Main", Icon = 1234567890, Select = true })
+        local Section = Tab:Section({ Title = "General" })
+        Section:AddToggle({ Name = "Enabled", Default = true, Callback = print })
+
+    Executor runtime support is intentionally limited to selecting a GUI host
+    through the UNC-compatible gethui() API and persistent UI configurations
+    through the UNC filesystem API. The library contains no hooks, input
+    simulation, game automation, networking, or other executor features.
+]]
 local Assets = {
     ["logo.jpg"] = "nil",
 	["close.png"] = "nil",
@@ -1002,7 +1021,8 @@ function Section:AddLabel(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
             Size = UDim2.new(1, -18, 0, 16),
             Position = UDim2.fromOffset(9, 25),
@@ -1196,7 +1216,8 @@ function Section:AddToggle(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
             Size = UDim2.new(1, -textRightInset, 0, 17),
             Position = UDim2.fromOffset(10, 29),
@@ -1412,9 +1433,10 @@ function Section:AddSlider(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
-            Size = UDim2.new(1, -20, 0, 14),
+            Size = UDim2.new(1, -20, 0, 15),
             Position = UDim2.fromOffset(10, 22),
         })
         bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
@@ -1551,7 +1573,8 @@ function Section:AddTextbox(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
             Size = UDim2.new(1, -20, 0, 15),
             Position = UDim2.fromOffset(10, 23),
@@ -1646,9 +1669,10 @@ function Section:AddDropdown(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
-            Size = UDim2.new(0.55, 0, 0, 13),
+            Size = UDim2.new(0.55, 0, 0, 14),
             Position = UDim2.fromOffset(12, 22),
         })
         bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
@@ -1679,13 +1703,24 @@ function Section:AddDropdown(options)
         Position = UDim2.new(1, -10, 0.5, 0),
     })
     bindThemeColor(arrow, "TextColor3", "MutedText")
-    local items = new("Frame", {
+    -- A ScrollingFrame handles both mouse-wheel input and touch swipes.  The
+    -- viewport stays five items tall while AutomaticCanvasSize keeps every
+    -- option reachable when the dropdown contains more entries.
+    local items = new("ScrollingFrame", {
+        Name = "Options",
+        Active = true,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
+        CanvasSize = UDim2.new(),
         Position = UDim2.fromOffset(10, closedHeight + 3),
+        ScrollBarImageColor3 = self.Window.Theme.Border,
+        ScrollBarThickness = 3,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
         Size = UDim2.new(1, -20, 0, 0),
         Parent = frame,
     })
+    bindThemeColor(items, "ScrollBarImageColor3", "Border")
     listLayout(items, 3)
     local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
@@ -1719,6 +1754,10 @@ function Section:AddDropdown(options)
     local function setOpen(open)
         isOpen = open
         local shown = math.min(#control.Values, 5)
+        items.Size = UDim2.new(1, -20, 0, shown * 27)
+        if not open then
+            items.CanvasPosition = Vector2.new()
+        end
         local targetHeight = open and (closedHeight + shown * 27 + 5) or closedHeight
         tween(frame, 0.13, { Size = UDim2.new(1, 0, 0, targetHeight) })
         tween(arrow, 0.13, { Rotation = open and 180 or 0 })
@@ -1751,6 +1790,7 @@ function Section:AddDropdown(options)
             option.Button:Destroy()
         end
         table.clear(optionButtons)
+        items.CanvasPosition = Vector2.new()
         for _, item in ipairs(control.Values) do
             local itemValue = item
             local itemButton = button(items, {
@@ -1831,9 +1871,10 @@ function Section:AddMultiDropdown(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
-            Size = UDim2.new(0.55, 0, 0, 13),
+            Size = UDim2.new(0.55, 0, 0, 14),
             Position = UDim2.fromOffset(12, 22),
         })
         bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
@@ -1864,13 +1905,24 @@ function Section:AddMultiDropdown(options)
         Position = UDim2.new(1, -10, 0.5, 0),
     })
     bindThemeColor(arrow, "TextColor3", "MutedText")
-    local items = new("Frame", {
+    -- A ScrollingFrame handles both mouse-wheel input and touch swipes.  The
+    -- viewport stays five items tall while AutomaticCanvasSize keeps every
+    -- option reachable when the dropdown contains more entries.
+    local items = new("ScrollingFrame", {
+        Name = "Options",
+        Active = true,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
+        CanvasSize = UDim2.new(),
         Position = UDim2.fromOffset(10, closedHeight + 3),
+        ScrollBarImageColor3 = self.Window.Theme.Border,
+        ScrollBarThickness = 3,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
         Size = UDim2.new(1, -20, 0, 0),
         Parent = frame,
     })
+    bindThemeColor(items, "ScrollBarImageColor3", "Border")
     listLayout(items, 3)
 
     local control = self:_newControl(titleSource, descriptionSource, frame, options)
@@ -1930,6 +1982,10 @@ function Section:AddMultiDropdown(options)
     local function setOpen(open)
         isOpen = open
         local shown = math.min(#control.Values, 5)
+        items.Size = UDim2.new(1, -20, 0, shown * 27)
+        if not open then
+            items.CanvasPosition = Vector2.new()
+        end
         local targetHeight = open and (closedHeight + shown * 27 + 5) or closedHeight
         tween(frame, 0.13, { Size = UDim2.new(1, 0, 0, targetHeight) })
         tween(arrow, 0.13, { Rotation = open and 180 or 0 })
@@ -2006,6 +2062,7 @@ function Section:AddMultiDropdown(options)
             option.Button:Destroy()
         end
         table.clear(optionButtons)
+        items.CanvasPosition = Vector2.new()
         for _, value in ipairs(control.Values) do
             local itemValue = value
             local itemButton = button(items, {
@@ -2076,7 +2133,8 @@ function Section:AddKeybind(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
             Size = UDim2.new(1, -100, 0, 17),
             Position = UDim2.fromOffset(10, 29),
@@ -2223,7 +2281,8 @@ function Section:AddColorPicker(options)
     if description ~= "" then
         descriptionLabel = text(frame, {
             Text = description,
-            TextSize = 10,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
             Size = UDim2.new(1, -66, 0, 17),
             Position = UDim2.fromOffset(10, 29),
@@ -4017,7 +4076,8 @@ function Library:CreateWindow(options)
     })
     local brandSubtitle = text(brand, {
         Text = subtitle,
-        TextSize = 9,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
         TextTruncate = Enum.TextTruncate.AtEnd,
         TextColor3 = theme.MutedText,
         Size = UDim2.new(1, -49, 0, 14),
@@ -4074,7 +4134,7 @@ function Library:CreateWindow(options)
     local sessionPanelStats = text(sessionPanel, {
         Name = "SessionStats",
         Text = "0:00  •  0 fps",
-        Font = Enum.Font.GothamMedium,
+        Font = Enum.Font.GothamBold,
         TextColor3 = theme.MutedText,
         TextSize = 9,
         TextTruncate = Enum.TextTruncate.AtEnd,
@@ -4132,7 +4192,7 @@ function Library:CreateWindow(options)
     local footerStats = text(footer, {
         Name = "SessionStats",
         Text = "0:00  •  0 fps",
-        Font = Enum.Font.GothamMedium,
+        Font = Enum.Font.GothamBold,
         TextColor3 = theme.MutedText,
         TextSize = 10,
         TextXAlignment = Enum.TextXAlignment.Center,
@@ -4195,11 +4255,12 @@ function Library:CreateWindow(options)
     )
     local pageSubtitle = text(header, {
         Text = subtitle,
-        TextSize = 9,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
         TextColor3 = theme.MutedText,
         TextTruncate = Enum.TextTruncate.AtEnd,
-        Size = UDim2.new(1, -250, 0, 15),
-        Position = UDim2.fromOffset(14, 34),
+        Size = UDim2.new(1, -250, 0, 16),
+        Position = UDim2.fromOffset(14, 33),
         Visible = subtitle ~= "",
     })
     bindThemeColor(pageSubtitle, "TextColor3", "MutedText")
