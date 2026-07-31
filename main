@@ -4653,7 +4653,7 @@ function Library:CreateWindow(options)
     local footerText = text(footer, {
         Text = localizedText(footerSource, language),
         Font = Enum.Font.GothamBold,
-        TextSize = 13,
+        TextSize = 11,
         TextXAlignment = Enum.TextXAlignment.Center,
         TextYAlignment = Enum.TextYAlignment.Center,
         Size = UDim2.new(1, -16, 0, 23),
