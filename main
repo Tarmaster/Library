@@ -1,32 +1,16 @@
---[[
-    Averlik UI
-    A standalone retained-mode UI library for Luau / Roblox clients.
 
-    Quick start:
-        local UI = require(path.to.Library)
-        local Window = UI:CreateWindow({
-            Title = "My Hub",
-            Subtitle = "v1.0",
-            Image = "rbxassetid://136486945503309",
-        })
-        local Tab = Window:Tab({ Name = "Main", Icon = 1234567890, Select = true })
-        local Section = Tab:Section({ Title = "General" })
-        Section:AddToggle({ Name = "Enabled", Default = true, Callback = print })
-
-    Executor runtime support is intentionally limited to selecting a GUI host
-    through the UNC-compatible gethui() API and persistent UI configurations
-    through the UNC filesystem API. The library contains no hooks, input
-    simulation, game automation, networking, or other executor features.
-]]
 local Assets = {
     ["logo.jpg"] = "nil",
-	["close.png"] = "nil",
 }
 
+-- Lucide is loaded once; all UI icons use the asset returned by GetAsset(name).
+local Lucide = loadstring(game:HttpGet("https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"))()
+
 local Library = {
-    Version = "1.5.0",
+    Version = "1.6.0",
     Windows = {},
-    Icons = {},
+    SupportsLucideIcons = Lucide ~= nil,
+    SupportsAutoLoad = true,
     _lastWindow = nil,
 }
 
@@ -35,6 +19,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+local TextService = game:GetService("TextService")
 
 local function isPointerInput(input)
     return input.UserInputType == Enum.UserInputType.MouseButton1
@@ -482,6 +467,79 @@ local function button(parent, properties)
     return control
 end
 
+-- Description labels share this small layout helper.  TextWrapped alone only
+-- hides the overflow in a fixed-height label; measuring the rendered text also
+-- lets the owning row grow by the exact number of extra lines.  The label's
+-- AbsoluteSize changes whenever a resizable window changes width, which makes
+-- this re-evaluate wrapping after every resize as well.
+local function bindWrappedDescription(control, descriptionLabel, applyLayout)
+    if not descriptionLabel then
+        return
+    end
+
+    descriptionLabel.TextWrapped = true
+    descriptionLabel.TextYAlignment = Enum.TextYAlignment.Top
+
+    local lastText = nil
+    local lastWidth = nil
+    local scheduled = false
+
+    local function refresh()
+        scheduled = false
+        if not descriptionLabel.Parent then
+            return
+        end
+
+        local value = descriptionLabel.Text or ""
+        local width = descriptionLabel.AbsoluteSize.X
+        -- Wait for Roblox's first layout pass instead of briefly measuring text
+        -- against a one-pixel-wide label while the control is being created.
+        if value ~= "" and width <= 0 then
+            return
+        end
+        if value == lastText and width == lastWidth then
+            return
+        end
+        lastText = value
+        lastWidth = width
+
+        local height = 0
+        if value ~= "" then
+            -- The first layout pass can happen before Roblox has calculated a
+            -- non-zero AbsoluteSize.  Keep one line in that case; the size
+            -- change signal below immediately supplies the real measurement.
+            local availableWidth = math.max(width, 1)
+            local measured = TextService:GetTextSize(
+                value,
+                descriptionLabel.TextSize,
+                descriptionLabel.Font,
+                Vector2.new(availableWidth, 10000)
+            )
+            local oneLine = TextService:GetTextSize(
+                "Ag",
+                descriptionLabel.TextSize,
+                descriptionLabel.Font,
+                Vector2.new(10000, 10000)
+            )
+            height = math.max(math.ceil(measured.Y), math.ceil(oneLine.Y))
+        end
+        applyLayout(height, value ~= "")
+    end
+
+    local function scheduleRefresh()
+        if scheduled then
+            return
+        end
+        scheduled = true
+        task.defer(refresh)
+    end
+
+    control._refreshDescriptionLayout = refresh
+    control:_track(descriptionLabel:GetPropertyChangedSignal("Text"):Connect(scheduleRefresh))
+    control:_track(descriptionLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(scheduleRefresh))
+    task.defer(refresh)
+end
+
 local function safeCall(callback, ...)
     if type(callback) ~= "function" then
         return
@@ -501,30 +559,22 @@ local function normalizeOptions(options)
     return type(options) == "table" and options or {}
 end
 
-local function resolveIcon(icon)
-    if type(icon) == "number" then
-        return "rbxassetid://" .. tostring(icon)
-    end
-    if type(icon) ~= "string" then
-        return ""
-    end
-    icon = Library.Icons[icon] or icon
-    if string.match(icon, "^%d+$") then
-        return "rbxassetid://" .. icon
-    end
-    if string.match(icon, "^rbxassetid://") or string.match(icon, "^rbxasset://") then
-        return icon
-    end
-    return ""
-end
-
 local function getGuiParent(preferredParent, useExecutorGui)
     return Runtime:ResolveParent(preferredParent, useExecutorGui)
 end
 
-local DEFAULT_CONFIG_FOLDER = "Averlik/Configs"
+-- Configs are stored below one common root.  ConfigFolder is intentionally a
+-- *game-specific* subfolder, so `ConfigFolder = "GAG2"` resolves to
+-- `Averlik Hub/Configs/GAG2` rather than mixing this game's configs with
+-- every other script's configs.
+local DEFAULT_CONFIG_ROOT = "Averlik Hub/Configs"
 local DEFAULT_CONFIG_EXTENSION = ".json"
 local CONFIG_TYPE_KEY = "__averlikType"
+-- This folder lives inside the current game's ConfigFolder.  It holds library
+-- metadata (rather than a user config), so every game keeps its own auto-load
+-- choice and List() never exposes the metadata as a selectable config.
+local CONFIG_METADATA_FOLDER = ".averlik"
+local AUTOLOAD_FILE_NAME = "autoload.json"
 
 local function trimString(value)
     return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
@@ -573,26 +623,43 @@ local function callFilesystem(name, ...)
     return true, result[2]
 end
 
-local function normalizeConfigFolder(folder)
-    folder = trimString(folder == nil and DEFAULT_CONFIG_FOLDER or folder)
+local function normalizeFolderPath(folder, optionName, allowEmpty)
+    folder = trimString(folder)
     folder = string.gsub(folder, "\\", "/")
     folder = string.gsub(folder, "^/+", "")
     folder = string.gsub(folder, "/+$", "")
     if folder == "" then
-        return nil, "ConfigFolder cannot be empty"
+        if allowEmpty then
+            return ""
+        end
+        return nil, optionName .. " cannot be empty"
     end
 
     local parts = {}
     for part in string.gmatch(folder, "[^/]+") do
         if part == "." or part == ".." or string.find(part, "[%c<>:\"|?*]") then
-            return nil, "ConfigFolder contains an invalid path component"
+            return nil, optionName .. " contains an invalid path component"
         end
         table.insert(parts, part)
     end
     if #parts == 0 then
-        return nil, "ConfigFolder cannot be empty"
+        return nil, optionName .. " cannot be empty"
     end
     return table.concat(parts, "/")
+end
+
+local function normalizeConfigRoot(root)
+    return normalizeFolderPath(
+        root == nil and DEFAULT_CONFIG_ROOT or root,
+        "ConfigRoot",
+        false
+    )
+end
+
+local function normalizeConfigFolder(folder)
+    -- An omitted ConfigFolder keeps compatibility with the old flat layout at
+    -- the root. Supplying one isolates the configs for that game.
+    return normalizeFolderPath(folder == nil and "" or folder, "ConfigFolder", true)
 end
 
 local function normalizeConfigExtension(extension)
@@ -879,6 +946,9 @@ function Control:SetDescription(value)
         self._descriptionLabel.Text = self.Description
         self._descriptionLabel.Visible = self.Description ~= ""
     end
+    if self._refreshDescriptionLayout then
+        self:_refreshDescriptionLayout()
+    end
     self._searchText = componentSearchText(self.Name, self.Description)
     return self
 end
@@ -892,6 +962,9 @@ function Control:_refreshLocalization()
     if self._descriptionLabel then
         self._descriptionLabel.Text = self.Description
         self._descriptionLabel.Visible = self.Description ~= ""
+    end
+    if self._refreshDescriptionLayout then
+        self:_refreshDescriptionLayout()
     end
     if self._refreshLocalizedText then
         self._refreshLocalizedText()
@@ -972,6 +1045,10 @@ function Section:_newControl(name, description, frame, configOptions)
         Value = nil,
         _callbacks = {},
         _connections = {},
+        -- Configs normally load controls in registration order.  A control
+        -- can opt into a later phase (toggles use this by default) so action
+        -- callbacks never start before their dependent values are restored.
+        ConfigLoadPriority = configOptions and tonumber(configOptions.ConfigLoadPriority) or 0,
         _searchText = componentSearchText(
             self.Window:_resolveLocalizedText(name),
             self.Window:_resolveLocalizedText(description)
@@ -1033,6 +1110,14 @@ function Section:AddLabel(options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = control.Name
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        if hasDescription then
+            descriptionLabel.Size = UDim2.new(1, -18, 0, descriptionHeight)
+            frame.Size = UDim2.new(1, 0, 0, 34 + descriptionHeight)
+        else
+            frame.Size = UDim2.new(1, 0, 0, 31)
+        end
+    end)
     function control:SetText(value)
         self:SetTitle(value)
         self.Value = self.Name
@@ -1070,6 +1155,10 @@ function Section:AddParagraph(options)
     control._titleLabel = titleLabel
     control._descriptionLabel = body
     control.Value = content
+    bindWrappedDescription(control, body, function(contentHeight, hasContent)
+        frame.Size = UDim2.new(1, 0, 0, hasContent and 33 + contentHeight or 31)
+        body.Size = UDim2.new(1, -20, 0, contentHeight)
+    end)
     function control:SetContent(value)
         self:SetDescription(value)
         self.Value = self.Description
@@ -1098,12 +1187,19 @@ function Section:AddButton(options)
     local title = self.Window:_resolveLocalizedText(titleSource)
     local description = self.Window:_resolveLocalizedText(descriptionSource)
     local callback = options.Callback or options.Function or options.Pressed
-    local frame = self:_row(description ~= "" and 55 or 41)
-    frame.BackgroundTransparency = 1
+    -- UIListLayout already supplies the inter-control gap.  Keeping 5 px
+    -- margins inside an invisible button row made neighbouring buttons look
+    -- farther apart than toggles and dropdowns.
+    local frame = new("Frame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 31),
+        Parent = self.Body,
+    })
     local clickable = button(frame, {
         BackgroundColor3 = options.Secondary and self.Window.Theme.SurfacePressed or self.Window.Theme.Accent,
         Size = UDim2.new(1, 0, 0, 31),
-        Position = UDim2.fromOffset(0, description ~= "" and 17 or 5),
+        Position = UDim2.new(),
         Text = title,
         Font = Enum.Font.GothamBold,
         TextSize = 12,
@@ -1115,10 +1211,31 @@ function Section:AddButton(options)
         bindThemeColor(clickable, "BackgroundColor3", "SurfacePressed")
         bindThemeColor(clickable, "TextColor3", "Text")
     end
-    corner(clickable, 6)
+    corner(clickable, 10) -- тут 6
     local shadow = uiShadow(clickable, clickable.BackgroundColor3, 0.46, 7, UDim2.fromOffset(0, 0), UDim2.fromOffset(1, 1))
     local control = self:_newControl(titleSource, descriptionSource, frame)
     control._titleLabel = clickable
+    local descriptionLabel = nil
+    if description ~= "" then
+        descriptionLabel = text(frame, {
+            Text = description,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
+            TextColor3 = self.Window.Theme.MutedText,
+            Size = UDim2.new(1, -20, 0, 14),
+            Position = UDim2.fromOffset(10, 0),
+        })
+        bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
+    end
+    control._descriptionLabel = descriptionLabel
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        local buttonY = hasDescription and descriptionHeight + 5 or 0
+        if hasDescription then
+            descriptionLabel.Size = UDim2.new(1, -20, 0, descriptionHeight)
+        end
+        clickable.Position = UDim2.fromOffset(0, buttonY)
+        frame.Size = UDim2.new(1, 0, 0, buttonY + 31)
+    end)
     control._callbacks = type(callback) == "function" and { callback } or {}
     local hovered = false
     local heldInput = nil
@@ -1233,10 +1350,30 @@ function Section:AddToggle(options)
     })
     local _, render = makeSwitch(switchHolder, self.Window.Theme, value)
     local control = self:_newControl(titleSource, descriptionSource, frame, options)
+    -- Toggles often start or stop work in their callbacks.  Load their state
+    -- after dropdowns, sliders, textboxes, keybinds and colour pickers have
+    -- restored the values that work depends on.  Users may override this
+    -- deliberately with ConfigLoadPriority when necessary.
+    if options.ConfigLoadPriority == nil then
+        control.ConfigLoadPriority = 100
+    end
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = value
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        if hasDescription then
+            titleLabel.Size = UDim2.new(1, -textRightInset, 0, 22)
+            titleLabel.Position = UDim2.fromOffset(10, 8)
+            descriptionLabel.Size = UDim2.new(1, -textRightInset, 0, descriptionHeight)
+            descriptionLabel.Position = UDim2.fromOffset(10, 29)
+            frame.Size = UDim2.new(1, 0, 0, 29 + descriptionHeight + 9)
+        else
+            titleLabel.Size = UDim2.new(1, -textRightInset, 1, 0)
+            titleLabel.Position = UDim2.fromOffset(10, 0)
+            frame.Size = UDim2.new(1, 0, 0, 37)
+        end
+    end)
     control._refreshTheme = function()
         render(control.Value, true)
     end
@@ -1265,7 +1402,7 @@ function Section:AddToggle(options)
             TextXAlignment = Enum.TextXAlignment.Center,
             ZIndex = 3,
         })
-        corner(bind, 5)
+        corner(bind, 5) -- тут 5
         bindThemeColor(stroke(bind, self.Window.Theme.Border, 1, 0.45), "Color", "Border")
         local bindGlow = uiShadow(bind, self.Window.Theme.Accent, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
         bindThemeColor(bindGlow, "Color", "Accent")
@@ -1489,6 +1626,18 @@ function Section:AddSlider(options)
     control.Max = maximum
     control.Step = step
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        if hasDescription then
+            descriptionLabel.Size = UDim2.new(1, -20, 0, descriptionHeight)
+            descriptionLabel.Position = UDim2.fromOffset(10, 22)
+            local nextBarY = 22 + descriptionHeight + 10
+            track.Position = UDim2.fromOffset(10, nextBarY)
+            frame.Size = UDim2.new(1, 0, 0, nextBarY + 25)
+        else
+            track.Position = UDim2.fromOffset(10, 37)
+            frame.Size = UDim2.new(1, 0, 0, 57)
+        end
+    end)
 
     local decimals = 0
     local asString = tostring(step)
@@ -1557,17 +1706,17 @@ function Section:AddTextbox(options)
     options = normalizeOptions(options)
     local titleSource = options.Name or options.Text or "Textbox"
     local descriptionSource = options.Description or ""
-    local placeholderSource = options.Placeholder or { "Enter text...", "Введите текст..." }
     local title = self.Window:_resolveLocalizedText(titleSource)
     local description = self.Window:_resolveLocalizedText(descriptionSource)
     local value = tostring(options.Default or options.Value or "")
-    local frame = self:_row(description ~= "" and 74 or 59)
-    local titleLabel = text(frame, {
-        Text = title,
-        Font = Enum.Font.GothamMedium,
-        TextSize = 12,
-        Size = UDim2.new(1, -20, 0, 20),
-        Position = UDim2.fromOffset(10, 5),
+    -- Unlike standard controls, a textbox does not need a separate surface
+    -- behind it: its name becomes the placeholder and the input itself is the
+    -- full-width visual container.
+    local frame = new("Frame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, description ~= "" and 58 or 39),
+        Parent = self.Body,
     })
     local descriptionLabel = nil
     if description ~= "" then
@@ -1577,39 +1726,63 @@ function Section:AddTextbox(options)
             TextSize = 11,
             TextColor3 = self.Window.Theme.MutedText,
             Size = UDim2.new(1, -20, 0, 15),
-            Position = UDim2.fromOffset(10, 23),
+            Position = UDim2.fromOffset(10, 0),
         })
         bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
-    local inputY = description ~= "" and 43 or 28
+    local inputY = description ~= "" and 19 or 0
     local input = new("TextBox", {
         BackgroundColor3 = Color3.fromRGB(19, 19, 20),
         BorderSizePixel = 0,
         ClearTextOnFocus = false,
         Font = Enum.Font.Gotham,
         PlaceholderColor3 = self.Window.Theme.SubtleText,
-        PlaceholderText = self.Window:_resolveLocalizedText(placeholderSource),
-        Size = UDim2.new(1, -20, 0, 25),
-        Position = UDim2.fromOffset(10, inputY),
+        PlaceholderText = title,
+        Size = UDim2.new(1, 0, 0, 39),
+        Position = UDim2.fromOffset(0, inputY),
         Text = value,
         TextColor3 = self.Window.Theme.Text,
-        TextSize = 10,
+        TextSize = 11,
         TextXAlignment = Enum.TextXAlignment.Left,
         Parent = frame,
     })
     bindThemeColor(input, "PlaceholderColor3", "SubtleText")
     bindThemeColor(input, "TextColor3", "Text")
-    corner(input, 5)
-    bindThemeColor(stroke(input, self.Window.Theme.Border, 1, 0.48), "Color", "Border")
-    padding(input, 8, 8)
+    corner(input, 10) -- тут 6
+    local inputStroke = stroke(input, self.Window.Theme.Border, 1, 0.48)
+    bindThemeColor(inputStroke, "Color", "Border")
+    local inputGlow = uiShadow(input, self.Window.Theme.Accent, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
+    bindThemeColor(inputGlow, "Color", "Accent")
+    inputGlow.Enabled = false
+    padding(input, 10, 10)
     local control = self:_newControl(titleSource, descriptionSource, frame, options)
-    control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
     control.Value = value
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
-    control._placeholderSource = placeholderSource
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        local inputY = hasDescription and descriptionHeight + 4 or 0
+        if hasDescription then
+            descriptionLabel.Size = UDim2.new(1, -20, 0, descriptionHeight)
+        end
+        input.Position = UDim2.fromOffset(0, inputY)
+        frame.Size = UDim2.new(1, 0, 0, inputY + 39)
+    end)
+    control._refreshTheme = function()
+        if input:IsFocused() then
+            input.BackgroundColor3 = Color3.fromRGB(24, 24, 25)
+            inputStroke.Color = control.Section.Window.Theme.Accent
+            inputStroke.Transparency = 0.18
+            inputGlow.Color = control.Section.Window.Theme.Accent
+            inputGlow.Enabled = true
+        else
+            input.BackgroundColor3 = Color3.fromRGB(19, 19, 20)
+            inputStroke.Color = control.Section.Window.Theme.Border
+            inputStroke.Transparency = 0.48
+            inputGlow.Enabled = false
+        end
+    end
     control._refreshLocalizedText = function()
-        input.PlaceholderText = control.Section.Window:_resolveLocalizedText(control._placeholderSource)
+        input.PlaceholderText = control.Name
     end
     function control:SetValue(nextValue, silent)
         nextValue = tostring(nextValue or "")
@@ -1620,17 +1793,23 @@ function Section:AddTextbox(options)
         end
         return self
     end
-    function control:SetPlaceholder(value)
-        self._placeholderSource = value
-        input.PlaceholderText = self.Section.Window:_resolveLocalizedText(value)
-        return self
-    end
     control:_track(input.Focused:Connect(function()
         tween(input, 0.12, { BackgroundColor3 = Color3.fromRGB(24, 24, 25) })
+        tween(inputStroke, 0.12, {
+            Color = control.Section.Window.Theme.Accent,
+            Transparency = 0.18,
+        })
+        inputGlow.Color = control.Section.Window.Theme.Accent
+        inputGlow.Enabled = true
         control:_scrollIntoView()
     end))
     control:_track(input.FocusLost:Connect(function(enterPressed)
         tween(input, 0.12, { BackgroundColor3 = Color3.fromRGB(19, 19, 20) })
+        tween(inputStroke, 0.12, {
+            Color = control.Section.Window.Theme.Border,
+            Transparency = 0.48,
+        })
+        inputGlow.Enabled = false
         if options.ClearOnSubmit and enterPressed then
             control:SetValue("")
         else
@@ -1784,6 +1963,22 @@ function Section:AddDropdown(options)
         end
         return self
     end
+    bindWrappedDescription(control, descriptionLabel, function(measuredHeight, hasDescription)
+        if hasDescription then
+            closedHeight = 22 + measuredHeight + 8
+            titleLabel.Position = UDim2.fromOffset(12, 6)
+            descriptionLabel.Size = UDim2.new(0.55, 0, 0, measuredHeight)
+            descriptionLabel.Position = UDim2.fromOffset(12, 22)
+        else
+            closedHeight = 39
+            titleLabel.Position = UDim2.fromOffset(12, 10)
+        end
+        selector.Size = UDim2.new(1, 0, 0, closedHeight)
+        items.Position = UDim2.fromOffset(10, closedHeight + 3)
+        local shown = math.min(#control.Values, 5)
+        local targetHeight = isOpen and (closedHeight + shown * 27 + 5) or closedHeight
+        frame.Size = UDim2.new(1, 0, 0, targetHeight)
+    end)
     function control:SetValues(nextValues)
         control.Values = type(nextValues) == "table" and nextValues or {}
         for _, option in ipairs(optionButtons) do
@@ -1996,6 +2191,22 @@ function Section:AddMultiDropdown(options)
     function control:GetValue()
         return copyArray(self.Value)
     end
+    bindWrappedDescription(control, descriptionLabel, function(measuredHeight, hasDescription)
+        if hasDescription then
+            closedHeight = 22 + measuredHeight + 8
+            titleLabel.Position = UDim2.fromOffset(12, 6)
+            descriptionLabel.Size = UDim2.new(0.55, 0, 0, measuredHeight)
+            descriptionLabel.Position = UDim2.fromOffset(12, 22)
+        else
+            closedHeight = 39
+            titleLabel.Position = UDim2.fromOffset(12, 10)
+        end
+        selector.Size = UDim2.new(1, 0, 0, closedHeight)
+        items.Position = UDim2.fromOffset(10, closedHeight + 3)
+        local shown = math.min(#control.Values, 5)
+        local targetHeight = isOpen and (closedHeight + shown * 27 + 5) or closedHeight
+        frame.Size = UDim2.new(1, 0, 0, targetHeight)
+    end)
     function control:SetValue(nextValues, silent)
         local requested = {}
         local function request(value)
@@ -2161,6 +2372,19 @@ function Section:AddKeybind(options)
     control.Value = key
     control.Key = key
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        if hasDescription then
+            titleLabel.Size = UDim2.new(1, -100, 0, 22)
+            titleLabel.Position = UDim2.fromOffset(10, 8)
+            descriptionLabel.Size = UDim2.new(1, -100, 0, descriptionHeight)
+            descriptionLabel.Position = UDim2.fromOffset(10, 29)
+            frame.Size = UDim2.new(1, 0, 0, 29 + descriptionHeight + 11)
+        else
+            titleLabel.Size = UDim2.new(1, -100, 0, 22)
+            titleLabel.Position = UDim2.fromOffset(10, 10)
+            frame.Size = UDim2.new(1, 0, 0, 43)
+        end
+    end)
     control._bindChangedCallbacks = {}
     local bindChanged = options.BindChanged or options.ChangedCallback or options.OnBindChanged
     if type(bindChanged) == "function" then
@@ -2297,7 +2521,7 @@ function Section:AddColorPicker(options)
         Text = "",
     })
     preserveControlColor(swatch)
-    corner(swatch, 5)
+    corner(swatch, 5) -- тут
     local glow = uiShadow(swatch, value, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
     preserveControlColor(glow)
 
@@ -2318,7 +2542,7 @@ function Section:AddColorPicker(options)
         Parent = pickerPanel,
     })
     preserveControlColor(colorPlane)
-    corner(colorPlane, 6)
+    corner(colorPlane, 6) -- тут
     local saturationLayer = new("Frame", {
         BackgroundColor3 = Color3.fromRGB(255, 255, 255),
         BorderSizePixel = 0,
@@ -2436,6 +2660,28 @@ function Section:AddColorPicker(options)
     control.Value = value
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
     local open = false
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        if hasDescription then
+            closedHeight = 29 + descriptionHeight + 11
+            pickerPanel.Position = UDim2.fromOffset(10, closedHeight + 4)
+            swatch.Position = UDim2.new(1, -10, 0, closedHeight / 2)
+        else
+            closedHeight = 43
+            pickerPanel.Position = UDim2.fromOffset(10, closedHeight + 4)
+            swatch.Position = UDim2.new(1, -10, 0, closedHeight / 2)
+        end
+        if hasDescription then
+            titleLabel.Size = UDim2.new(1, -66, 0, 22)
+            titleLabel.Position = UDim2.fromOffset(10, 8)
+            descriptionLabel.Size = UDim2.new(1, -66, 0, descriptionHeight)
+            descriptionLabel.Position = UDim2.fromOffset(10, 29)
+            frame.Size = UDim2.new(1, 0, 0, open and closedHeight + 124 or closedHeight)
+        else
+            titleLabel.Size = UDim2.new(1, -66, 0, 22)
+            titleLabel.Position = UDim2.fromOffset(10, 10)
+            frame.Size = UDim2.new(1, 0, 0, open and closedHeight + 124 or closedHeight)
+        end
+    end)
     local hue, saturation, brightness = Color3.toHSV(value)
 
     local function colorToHex(color)
@@ -2691,15 +2937,16 @@ function Tab:_refreshLocalization()
 end
 
 function Tab:SetIcon(icon, iconTint)
-    local image = resolveIcon(icon)
-    self.Icon = image
+    assert(type(icon) == "string" and icon ~= "", "SetIcon expects a Lucide icon name")
+    local iconData = Lucide.GetAsset(icon)
+    assert(type(iconData) == "table" and type(iconData.Url) == "string", "Lucide could not resolve icon: " .. icon)
+    self.Icon = iconData.Url
     if iconTint ~= nil then
         self.IconTint = iconTint ~= false
     end
-    self.IconLabel.Image = image
-    self.IconLabel.Visible = image ~= ""
-    self.TitleLabel.Size = UDim2.new(1, image ~= "" and -40 or -22, 1, 0)
-    self.TitleLabel.Position = UDim2.fromOffset(image ~= "" and 34 or 12, 0)
+    self.IconLabel.Image = iconData.Url
+    self.IconLabel.ImageRectOffset = iconData.ImageRectOffset
+    self.IconLabel.ImageRectSize = iconData.ImageRectSize
     self.Window:_styleTab(self, self.Selected)
     return self
 end
@@ -3065,8 +3312,11 @@ function Window:Tab(options)
     local descriptionSource = options.Description or ""
     local name = self:_resolveLocalizedText(nameSource)
     local description = self:_resolveLocalizedText(descriptionSource)
-    local iconImage = resolveIcon(options.Icon or options.Image)
-    local hasIcon = iconImage ~= ""
+    local iconName = options.Icon
+    assert(type(iconName) == "string" and iconName ~= "", "Tab expects a Lucide icon name in Icon")
+    local iconData = Lucide.GetAsset(iconName)
+    assert(type(iconData) == "table" and type(iconData.Url) == "string", "Lucide could not resolve icon: " .. iconName)
+    local iconImage = iconData.Url
     local tabContainer = new("CanvasGroup", {
         Name = name .. "Entrance",
         BackgroundTransparency = 1,
@@ -3084,21 +3334,37 @@ function Window:Tab(options)
         Text = "",
     })
     corner(tabButton, 6)
+    -- UIShadow uses the bounds of its parent.  Keep the icon itself unclipped,
+    -- but give its glow a separate circular parent so the glow is round rather
+    -- than following the ImageLabel's square bounds.
+    local iconGlowMask = new("Frame", {
+        Name = "IconGlowMask",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        AnchorPoint = Vector2.new(0, 0.5),
+        Size = UDim2.fromOffset(20, 20),
+        Position = UDim2.new(0, 7, 0.5, 0),
+        Parent = tabButton,
+    })
+    new("UICorner", {
+        CornerRadius = UDim.new(1, 0),
+        Parent = iconGlowMask,
+    })
     local icon = new("ImageLabel", {
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
         AnchorPoint = Vector2.new(0, 0.5),
         Image = iconImage,
+        ImageRectOffset = iconData.ImageRectOffset,
+        ImageRectSize = iconData.ImageRectSize,
         ImageColor3 = options.IconTint == false and Color3.fromRGB(255, 255, 255) or self.Theme.MutedText,
         ScaleType = Enum.ScaleType.Fit,
-        Size = UDim2.fromOffset(21, 21),
+        Size = UDim2.fromOffset(20, 20),
         Position = UDim2.new(0, 7, 0.5, 0),
-        Visible = hasIcon,
         Parent = tabButton,
     })
-    corner(icon, 11)
     -- The third uiShadow argument is the transparency the glow reaches when the tab is selected.
-    local iconGlow = uiShadow(icon, self.Theme.Accent, 0.85, 7, UDim2.new(), UDim2.fromOffset(1, 1))
+    local iconGlow = uiShadow(iconGlowMask, self.Theme.Accent, 0.85, 7, UDim2.new(), UDim2.fromOffset(1, 1))
     local iconGlowTransparency = iconGlow.Transparency
     local iconGlowRadius = iconGlow.BlurRadius
     iconGlow.Transparency = 1
@@ -3110,8 +3376,8 @@ function Window:Tab(options)
         TextSize = 12,
         TextColor3 = self.Theme.MutedText,
         TextTruncate = Enum.TextTruncate.AtEnd,
-        Size = UDim2.new(1, hasIcon and -40 or -22, 1, 0),
-        Position = UDim2.fromOffset(hasIcon and 34 or 12, 0),
+        Size = UDim2.new(1, -40, 1, 0),
+        Position = UDim2.fromOffset(34, 0),
     })
     local pageContainer = new("CanvasGroup", {
         Name = name .. "PageContainer",
@@ -3160,6 +3426,7 @@ function Window:Tab(options)
         ButtonContainer = tabContainer,
         Button = tabButton,
         IconLabel = icon,
+        IconGlowMask = iconGlowMask,
         IconGlow = iconGlow,
         IconGlowTransparency = iconGlowTransparency,
         IconGlowRadius = iconGlowRadius,
@@ -3683,6 +3950,128 @@ function Configurations:_resolvePath(name)
     return self.Folder .. "/" .. configName .. self.Extension, configName
 end
 
+function Configurations:_getAutoLoadPath()
+    return self.MetadataFolder .. "/" .. AUTOLOAD_FILE_NAME
+end
+
+-- Returns true and the selected config name when an auto-load selection
+-- exists.  A successful result with nil as the second value means that no
+-- config has been selected for auto-load yet.
+function Configurations:GetAutoLoad()
+    local available, availabilityError = requireFilesystemFunctions("isfile", "readfile")
+    if not available then
+        return false, availabilityError
+    end
+
+    local path = self:_getAutoLoadPath()
+    local checked, exists = callFilesystem("isfile", path)
+    if not checked then
+        return false, "Unable to inspect auto-load setting: " .. tostring(exists)
+    end
+    if not exists then
+        return true, nil
+    end
+
+    local read, contents = callFilesystem("readfile", path)
+    if not read then
+        return false, "Unable to read auto-load setting: " .. tostring(contents)
+    end
+    local decoded, decodeError = pcall(HttpService.JSONDecode, HttpService, contents)
+    if not decoded or type(decodeError) ~= "table" then
+        return false, "Auto-load setting is not valid JSON"
+    end
+    local configName, nameError = normalizeConfigName(decodeError.Config, self.Extension)
+    if not configName then
+        return false, "Auto-load setting is invalid: " .. tostring(nameError)
+    end
+    return true, configName
+end
+
+-- Stores a config as the auto-load choice for this window's ConfigFolder.
+-- The config must already exist, preventing a broken selection from being
+-- written by a toggle before the user has chosen a config.
+function Configurations:SetAutoLoad(name)
+    local configPath, configName = self:_resolvePath(name)
+    if not configPath then
+        return false, configName
+    end
+    local available, availabilityError = requireFilesystemFunctions("isfile", "writefile")
+    if not available then
+        return false, availabilityError
+    end
+
+    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    if not folderReady then
+        return false, folderError
+    end
+    local checked, exists = callFilesystem("isfile", configPath)
+    if not checked then
+        return false, "Unable to inspect config: " .. tostring(exists)
+    end
+    if not exists then
+        return false, "Config '" .. configName .. "' does not exist"
+    end
+
+    local metadataReady, metadataError = ensureConfigFolder(self.MetadataFolder)
+    if not metadataReady then
+        return false, metadataError
+    end
+    local encoded, encodeError = pcall(HttpService.JSONEncode, HttpService, {
+        Version = 1,
+        Config = configName,
+    })
+    if not encoded then
+        return false, "Unable to encode auto-load setting: " .. tostring(encodeError)
+    end
+    local written, writeError = callFilesystem("writefile", self:_getAutoLoadPath(), encodeError)
+    if not written then
+        return false, "Unable to save auto-load setting: " .. tostring(writeError)
+    end
+    return true, configName
+end
+
+-- Clearing a setting which does not exist is intentionally successful.  This
+-- makes an Auto Load toggle safe to turn off at any time.
+function Configurations:ClearAutoLoad()
+    local available, availabilityError = requireFilesystemFunctions("isfile", "delfile")
+    if not available then
+        return false, availabilityError
+    end
+    local path = self:_getAutoLoadPath()
+    local checked, exists = callFilesystem("isfile", path)
+    if not checked then
+        return false, "Unable to inspect auto-load setting: " .. tostring(exists)
+    end
+    if not exists then
+        return true
+    end
+    local deleted, deleteError = callFilesystem("delfile", path)
+    if not deleted then
+        return false, "Unable to clear auto-load setting: " .. tostring(deleteError)
+    end
+    return true
+end
+
+-- Loads the remembered config.  This is normally scheduled automatically by
+-- CreateWindow after the calling script has finished adding its controls.
+function Configurations:LoadAutoLoad()
+    local selected, configName = self:GetAutoLoad()
+    if not selected then
+        return false, configName
+    end
+    if configName == nil then
+        return true, nil, 0
+    end
+
+    local loaded, result = self:Load(configName)
+    if not loaded and string.find(tostring(result), "does not exist", 1, true) then
+        -- A file removed outside the library should not leave the GUI trying
+        -- to auto-load it on every future run.
+        self:ClearAutoLoad()
+    end
+    return loaded, configName, result
+end
+
 function Configurations:_serialize()
     local values = {}
     for _, control in ipairs(self.Window._configControls) do
@@ -3827,16 +4216,48 @@ function Configurations:Load(name)
         end
     end
 
-    local loaded = 0
-    for _, control in ipairs(self.Window._configControls) do
+    -- Controls that only store values (dropdowns, sliders, textboxes, etc.)
+    -- must be restored before toggles.  Toggle callbacks commonly start
+    -- work immediately and rely on those other callbacks having populated a
+    -- script's state first.  Keep original registration order within each
+    -- priority so dependent non-toggle controls remain deterministic.
+    local controlsToLoad = {}
+    for index, control in ipairs(self.Window._configControls) do
         if control.SaveConfig ~= false and preparedValues[control.Flag] ~= nil then
-            local applyValue = control._setConfigValue or control.SetValue
-            local applied, applyError = pcall(applyValue, control, preparedValues[control.Flag])
-            if not applied then
-                return false, "Cannot apply '" .. control.Flag .. "': " .. tostring(applyError)
-            end
-            loaded = loaded + 1
+            table.insert(controlsToLoad, {
+                Control = control,
+                Index = index,
+                Priority = tonumber(control.ConfigLoadPriority) or 0,
+            })
         end
+    end
+    table.sort(controlsToLoad, function(left, right)
+        if left.Priority == right.Priority then
+            return left.Index < right.Index
+        end
+        return left.Priority < right.Priority
+    end)
+
+    local loaded = 0
+    local previousPriority = nil
+    for _, entry in ipairs(controlsToLoad) do
+        -- Callbacks are intentionally run through task.spawn by Control:_emit.
+        -- Yielding once between phases lets callbacks from dropdowns/sliders
+        -- update their owning script before any toggle callback can start its
+        -- feature.  For the built-in controls this means priority 0 first and
+        -- toggles at priority 100 last.
+        if previousPriority ~= nil and entry.Priority ~= previousPriority then
+            task.wait()
+        end
+
+        local control = entry.Control
+        local applyValue = control._setConfigValue or control.SetValue
+        local applied, applyError = pcall(applyValue, control, preparedValues[control.Flag])
+        if not applied then
+            return false, "Cannot apply '" .. control.Flag .. "': " .. tostring(applyError)
+        end
+        previousPriority = entry.Priority
+        loaded = loaded + 1
     end
     return true, loaded
 end
@@ -3865,6 +4286,14 @@ function Configurations:Delete(name)
     if not deleted then
         return false, "Unable to delete config: " .. tostring(deleteError)
     end
+    -- Do not keep an auto-load entry that points to a deleted game config.
+    -- Ignore metadata read/clear failures here: the requested destructive
+    -- action did succeed, and returning a failure would incorrectly suggest
+    -- that the config file is still present.
+    local autoLoadRead, autoLoadName = self:GetAutoLoad()
+    if autoLoadRead and autoLoadName == configName then
+        self:ClearAutoLoad()
+    end
     return true, configName
 end
 
@@ -3891,6 +4320,45 @@ function Window:DeleteConfig(name)
 end
 
 Window.GetConfigs = Window.ListConfigs
+
+function Window:GetAutoLoadConfig()
+    return self.Configs:GetAutoLoad()
+end
+
+function Window:SetAutoLoadConfig(name)
+    return self.Configs:SetAutoLoad(name)
+end
+
+function Window:ClearAutoLoadConfig()
+    return self.Configs:ClearAutoLoad()
+end
+
+function Window:LoadAutoLoadConfig()
+    local loaded, configName, result = self.Configs:LoadAutoLoad()
+    self.AutoLoadResult = {
+        Success = loaded,
+        Config = configName,
+        Result = result,
+    }
+    for _, callback in ipairs(self._autoLoadCallbacks) do
+        safeCall(callback, loaded, configName, result)
+    end
+    return loaded, configName, result
+end
+
+function Window:OnAutoLoad(callback)
+    assert(type(callback) == "function", "OnAutoLoad expects a function")
+    table.insert(self._autoLoadCallbacks, callback)
+    if self.AutoLoadResult then
+        safeCall(
+            callback,
+            self.AutoLoadResult.Success,
+            self.AutoLoadResult.Config,
+            self.AutoLoadResult.Result
+        )
+    end
+    return self
+end
 
 function Window:_fireOnUnload()
     if self._onUnloadFired then
@@ -3962,8 +4430,11 @@ function Library:CreateWindow(options)
     local position = typeof(options.Position) == "UDim2" and options.Position or UDim2.fromScale(0.5, 0.5)
     local sidebarWidth = math.clamp(tonumber(options.SidebarWidth) or 161, 130, 220)
     local headerHeight = 62
+    local configRoot, configRootError = normalizeConfigRoot(options.ConfigRoot)
+    assert(configRoot, configRootError)
     local configFolder, configFolderError = normalizeConfigFolder(options.ConfigFolder)
-    assert(configFolder, configFolderError)
+    assert(configFolder ~= nil, configFolderError)
+    local configPath = configFolder == "" and configRoot or configRoot .. "/" .. configFolder
     local configExtension, configExtensionError = normalizeConfigExtension(options.ConfigExtension)
     assert(configExtension, configExtensionError)
     local parent, hostKind = getGuiParent(options.Parent, options.UseExecutorGui)
@@ -4307,12 +4778,15 @@ function Library:CreateWindow(options)
     })
     bindThemeColor(close, "BackgroundColor3", "CloseButton")
     corner(close, 10)
+    local closeIconData = Lucide.GetAsset("x")
     local closeIcon = new("ImageLabel", {
         Name = "CloseIcon",
         AnchorPoint = Vector2.new(0.5, 0.5),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        Image = Assets["close.png"] or "",
+        Image = closeIconData.Url,
+        ImageRectOffset = closeIconData.ImageRectOffset,
+        ImageRectSize = closeIconData.ImageRectSize,
         ImageColor3 = theme.Text,
         Position = UDim2.fromScale(0.5, 0.5),
         ScaleType = Enum.ScaleType.Fit,
@@ -4496,16 +4970,22 @@ function Library:CreateWindow(options)
         _visibilityToken = 0,
         _expandedSize = size,
         ToggleKey = nil,
+        ConfigRoot = configRoot,
         ConfigFolder = configFolder,
+        ConfigPath = configPath,
         ConfigExtension = configExtension,
         _configControls = {},
         _configControlsByFlag = {},
+        _autoLoadCallbacks = {},
         _footerCallback = options.FooterCallback or options.DiscordCallback or options.FooterPressed,
     }, Window)
     window.Theme = createThemeProxy(window, theme)
     window.Configs = setmetatable({
         Window = window,
-        Folder = configFolder,
+        Root = configRoot,
+        Folder = configPath,
+        MetadataFolder = configPath .. "/" .. CONFIG_METADATA_FOLDER,
+        GameFolder = configFolder,
         Extension = configExtension,
     }, Configurations)
     window.Config = window.Configs
@@ -4647,6 +5127,18 @@ function Library:CreateWindow(options)
     end))
     table.insert(Library.Windows, window)
     Library._lastWindow = window
+    -- The defer lets the calling script finish creating tabs and controls
+    -- after CreateWindow returns.  Therefore every flagged control exists
+    -- when a remembered config applies its values.  Pass AutoLoad = false to
+    -- manage the timing yourself with Window:LoadAutoLoadConfig().
+    if options.AutoLoad ~= false then
+        task.defer(function()
+            if window._destroyed then
+                return
+            end
+            window:LoadAutoLoadConfig()
+        end)
+    end
     if window.AnimationsEnabled then
         window._entranceTweens = {
             tween(root, WINDOW_TRANSITION_DURATION, {
@@ -4665,18 +5157,6 @@ end
 
 Library.New = Library.CreateWindow
 Library.Window = Library.CreateWindow
-
-function Library:RegisterIcon(name, icon)
-    assert(type(name) == "string" and name ~= "", "RegisterIcon expects a non-empty icon name")
-    local image = resolveIcon(icon)
-    assert(image ~= "", "RegisterIcon expects an rbxassetid://, rbxasset://, or numeric asset id")
-    self.Icons[name] = image
-    return image
-end
-
-function Library:ResolveIcon(icon)
-    return resolveIcon(icon)
-end
 
 function Library:GetRuntimeInfo()
     return Runtime:GetInfo()
@@ -4773,5 +5253,6 @@ Section.MultiDropdown = Section.AddMultiDropdown
 Section.Keybind = Section.AddKeybind
 Section.ColorPicker = Section.AddColorPicker
 
+print('load')
 getgenv().Library = Library
 return Library
