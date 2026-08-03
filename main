@@ -1,4 +1,4 @@
-
+print("v2")
 local Assets = {
     ["logo.jpg"] = "nil",
 }
