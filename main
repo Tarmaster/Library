@@ -3708,13 +3708,20 @@ function Window:_playUnloadAnimation(completed)
     end
 
     local windowLayer = self.WindowLayer
-    if not self.AnimationsEnabled or not windowLayer then
+    local root = self.Root
+    if not self.AnimationsEnabled or not windowLayer or not root then
         finish()
         return true
     end
 
     windowLayer.Visible = true
-    windowLayer.GroupTransparency = 0
+    if self.Visible then
+        root.GroupTransparency = self._restingGroupTransparency or 0
+    end
+    local notifications = self.Notifications
+    if notifications then
+        notifications.GroupTransparency = 0
+    end
     if self.SessionPanel then
         self.SessionPanel.GroupTransparency = 0
     end
@@ -3732,9 +3739,14 @@ function Window:_playUnloadAnimation(completed)
         )
     end
     self:_playTabsExit(contentExitDuration, contentExitStagger, maximumContentExitDelay)
-    local fade = tween(windowLayer, WINDOW_UNLOAD_DURATION, {
+    local fade = tween(root, WINDOW_UNLOAD_DURATION, {
         GroupTransparency = 1,
     }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+    if notifications then
+        tween(notifications, WINDOW_UNLOAD_DURATION, {
+            GroupTransparency = 1,
+        }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+    end
     if self.SessionPanel then
         tween(self.SessionPanel, WINDOW_UNLOAD_DURATION, {
             GroupTransparency = 1,
@@ -4451,7 +4463,10 @@ function Library:CreateWindow(options)
     -- Keep the main window and its notifications on a layer that can be
     -- hidden without disabling ScreenGui. The floating session panel remains
     -- interactive and can therefore restore a closed window.
-    local windowLayer = new("CanvasGroup", {
+    -- This layer only controls visibility. Keeping it as a Frame avoids a
+    -- second CanvasGroup compositing pass around the window, which can soften
+    -- text on displays that use non-default resolution or scaling.
+    local windowLayer = new("Frame", {
         Name = "WindowLayer",
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -4841,10 +4856,11 @@ function Library:CreateWindow(options)
         Size = UDim2.new(1, 0, 1, -headerHeight),
         Parent = main,
     })
-    local notificationLayer = new("Frame", {
+    local notificationLayer = new("CanvasGroup", {
         Name = "Notifications",
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
+        GroupTransparency = 0,
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, 0, 0, 18),
         Size = UDim2.fromOffset(300, 600),
