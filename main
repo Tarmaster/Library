@@ -1,4 +1,4 @@
-print("v2")
+
 local Assets = {
     ["logo.jpg"] = "nil",
 }
@@ -400,15 +400,10 @@ local function bindThemeColor(instance, property, themeKey)
     return instance
 end
 
--- Public positions describe the centre of a window. The window itself is
--- top-left anchored so resizing never repositions its rendered CanvasGroup.
-local function centeredWindowPosition(position, size)
-    return UDim2.new(
-        position.X.Scale - size.X.Scale / 2,
-        position.X.Offset - size.X.Offset / 2,
-        position.Y.Scale - size.Y.Scale / 2,
-        position.Y.Offset - size.Y.Offset / 2
-    )
+-- Public positions describe the centre of a window. The root uses a centre
+-- anchor so changing UIScale grows or shrinks around this same screen point.
+local function centeredWindowPosition(position)
+    return position
 end
 
 local function padding(parent, left, right, top, bottom)
@@ -3546,6 +3541,21 @@ function Window:GetTransparency()
     return self.Transparency
 end
 
+function Window:SetScale(value)
+    assert(type(value) == "number", "SetScale expects a number from 0.5 to 2")
+
+    self.Scale = math.clamp(value, 0.5, 2)
+    if self.UIScale then
+        self.UIScale.Scale = self.Scale
+    end
+
+    return self
+end
+
+function Window:GetScale()
+    return self.Scale
+end
+
 function Window:SetToggleKey(key)
     if key == nil or key == false then
         self.ToggleKey = nil
@@ -3669,7 +3679,7 @@ end
 function Window:SetPosition(position)
     assert(typeof(position) == "UDim2", "SetPosition expects UDim2")
     self.Position = position
-    self.Root.Position = centeredWindowPosition(position, self.Root.Size)
+    self.Root.Position = centeredWindowPosition(position)
     return self
 end
 
@@ -3678,7 +3688,7 @@ function Window:SetSize(size)
     self._expandedSize = size
     if not self.Minimized then
         self.Root.Size = size
-        self.Root.Position = centeredWindowPosition(self.Position, size)
+        self.Root.Position = centeredWindowPosition(self.Position)
     end
     return self
 end
@@ -3828,10 +3838,12 @@ function Window:Minimize(state)
         self.SizeConstraint.MinSize = self.Minimized and Vector2.new(1, 42)
             or Vector2.new(460, 300)
     end
-    local target = self.Minimized and UDim2.fromOffset(self.Root.AbsoluteSize.X, 42) or self._expandedSize
+    local currentScale = math.max(self.Scale or 1, 0.001)
+    local currentWidth = self.Root.AbsoluteSize.X / currentScale
+    local target = self.Minimized and UDim2.fromOffset(currentWidth, 42) or self._expandedSize
     tween(self.Root, 0.18, {
         Size = target,
-        Position = centeredWindowPosition(self.Position, target),
+        Position = centeredWindowPosition(self.Position),
     })
     return self
 end
@@ -4438,6 +4450,7 @@ function Library:CreateWindow(options)
     local mobile = isTouchDevice(options)
     local animationsEnabled = options.Animations ~= false
     local transparency = math.clamp(tonumber(options.Transparency) or WINDOW_VISIBLE_TRANSPARENCY, 0, 1)
+    local scale = math.clamp(tonumber(options.Scale) or 1, 0.5, 2)
     local size = typeof(options.Size) == "UDim2" and options.Size or UDim2.fromOffset(650, 430)
     local position = typeof(options.Position) == "UDim2" and options.Position or UDim2.fromScale(0.5, 0.5)
     local sidebarWidth = math.clamp(tonumber(options.SidebarWidth) or 161, 130, 220)
@@ -4478,14 +4491,22 @@ function Library:CreateWindow(options)
     -- sidebar/header cannot paint square pixels over the outer rounded edge.
     local root = new("CanvasGroup", {
         Name = "Window",
-        AnchorPoint = Vector2.new(),
+        AnchorPoint = Vector2.new(0.5, 0.5),
         BackgroundColor3 = theme.Background,
         BorderSizePixel = 0,
         ClipsDescendants = true,
         GroupTransparency = animationsEnabled and WINDOW_HIDDEN_TRANSPARENCY or transparency,
-        Position = centeredWindowPosition(position, size),
+        Position = centeredWindowPosition(position),
         Size = size,
         Parent = windowLayer,
+    })
+    -- Keep scaling on the centred window itself. Scaling the full-screen
+    -- layer would use its top-left origin and pull the window toward (0, 0).
+    -- The session panel remains directly under ScreenGui and is unaffected.
+    local uiScale = new("UIScale", {
+        Name = "GuiScale",
+        Scale = scale,
+        Parent = root,
     })
     bindThemeColor(root, "BackgroundColor3", "Background")
     corner(root, 18)
@@ -4937,6 +4958,7 @@ function Library:CreateWindow(options)
         Subtitle = subtitle,
         Position = position,
         Transparency = transparency,
+        Scale = scale,
         Visible = true,
         Minimized = false,
         IsMobile = mobile,
@@ -4945,6 +4967,7 @@ function Library:CreateWindow(options)
         Runtime = Runtime:GetInfo(),
         Root = root,
         ScreenGui = screenGui,
+        UIScale = uiScale,
         WindowLayer = windowLayer,
         _restingGroupTransparency = transparency,
         Shadow = shadow,
@@ -5093,6 +5116,8 @@ function Library:CreateWindow(options)
             startWindowPosition = window.Position
         end
         local function moveDrag(input)
+            local interfaceScale = math.max(window.Scale or 1, 0.001)
+            local rawDelta = input.Position - dragStart
             local delta = input.Position - dragStart
             local nextPosition = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
             root.Position = nextPosition
@@ -5109,29 +5134,32 @@ function Library:CreateWindow(options)
     if options.Resizable == true then
         local resizeStart
         local startSize
-        local startPosition
         local startWindowPosition
         trackPointerDrag(window, resizeHandle, function(input)
             resizeStart = input.Position
-            startSize = root.AbsoluteSize
-            startPosition = root.Position
+            local interfaceScale = math.max(window.Scale or 1, 0.001)
+            local renderedSize = root.AbsoluteSize
+            startSize = Vector2.new(renderedSize.X / interfaceScale, renderedSize.Y / interfaceScale)
             startWindowPosition = window.Position
         end, function(input)
-            local delta = input.Position - resizeStart
+            local interfaceScale = math.max(window.Scale or 1, 0.001)
+            local rawDelta = input.Position - resizeStart
+            local delta = Vector2.new(rawDelta.X / interfaceScale, rawDelta.Y / interfaceScale)
             local nextWidth = math.clamp(startSize.X + delta.X, 460, 1100)
             local nextHeight = math.clamp(startSize.Y + delta.Y, 300, 820)
             local nextSize = UDim2.fromOffset(nextWidth, nextHeight)
             root.Size = nextSize
-            -- Root is top-left anchored, so the CanvasGroup itself never
-            -- moves while resizing and its contents remain pixel-stable.
+            -- Keep the top-left edge fixed while the centre-anchored root
+            -- expands from its bottom-right resize handle.
             local appliedDelta = Vector2.new(nextWidth - startSize.X, nextHeight - startSize.Y)
-            root.Position = startPosition
-            window.Position = UDim2.new(
+            local nextWindowPosition = UDim2.new(
                 startWindowPosition.X.Scale,
                 startWindowPosition.X.Offset + appliedDelta.X / 2,
                 startWindowPosition.Y.Scale,
                 startWindowPosition.Y.Offset + appliedDelta.Y / 2
             )
+            root.Position = centeredWindowPosition(nextWindowPosition)
+            window.Position = nextWindowPosition
             window._expandedSize = nextSize
         end)
     end
