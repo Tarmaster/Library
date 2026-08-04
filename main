@@ -3,7 +3,6 @@ local Assets = {
     ["logo.jpg"] = "nil",
 }
 
--- Lucide is loaded once; all UI icons use the asset returned by GetAsset(name).
 local Lucide = loadstring(game:HttpGet("https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"))()
 
 local Library = {
@@ -48,9 +47,6 @@ for name,_ in pairs(Assets) do
     Assets[name] = getcustomasset("Averlik Hub/Assets/"..name)
 end
 
--- Keeps a drag bound to the input object that began it.  This is important on
--- touch screens: a second finger scrolling a page must not move a slider,
--- colour picker, resize handle, or window being controlled by the first one.
 local function trackPointerDrag(owner, target, began, moved, ended)
     local activeInput = nil
 
@@ -100,8 +96,6 @@ Control.__index = Control
 local Configurations = {}
 Configurations.__index = Configurations
 
--- Keeps executor-specific behavior at the edge of the library. The UI itself
--- only receives a normal Instance parent and remains usable in PlayerGui.
 local ExecutorRuntime = {}
 ExecutorRuntime.__index = ExecutorRuntime
 
@@ -180,8 +174,6 @@ local Theme = {
     SectionTitle = Color3.fromRGB(241, 241, 242),
 }
 
--- The exit transition is intentionally shorter, so repeated GUI toggles feel
--- responsive while the first entrance can stay more deliberate.
 local WINDOW_TRANSITION_DURATION = 0.26
 local WINDOW_CLOSE_DURATION = 0.10
 local WINDOW_UNLOAD_DURATION = 0.52
@@ -5152,11 +5144,15 @@ function Library:CreateWindow(options)
             -- Keep the top-left edge fixed while the centre-anchored root
             -- expands from its bottom-right resize handle.
             local appliedDelta = Vector2.new(nextWidth - startSize.X, nextHeight - startSize.Y)
+            -- Position offsets are screen pixels, while appliedDelta is in
+            -- unscaled GUI pixels. Convert the compensation back to screen
+            -- pixels so the top-left edge stays fixed at every UIScale value.
+            local positionDelta = appliedDelta * interfaceScale / 2
             local nextWindowPosition = UDim2.new(
                 startWindowPosition.X.Scale,
-                startWindowPosition.X.Offset + appliedDelta.X / 2,
+                startWindowPosition.X.Offset + positionDelta.X,
                 startWindowPosition.Y.Scale,
-                startWindowPosition.Y.Offset + appliedDelta.Y / 2
+                startWindowPosition.Y.Offset + positionDelta.Y
             )
             root.Position = centeredWindowPosition(nextWindowPosition)
             window.Position = nextWindowPosition
