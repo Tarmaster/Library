@@ -45,7 +45,9 @@ for name,_ in pairs(Assets) do
         writefile("Averlik Hub/Assets/"..name,game:HttpGet("https://github.com/Tarmaster/Library/blob/main/assets/"..name.."?raw=true"))
         task.wait(0.05)
     end
-    Assets[name] = getcustomasset("Averlik Hub/Assets/"..name)
+    pcall(function()
+        Assets[name] = getcustomasset("Averlik Hub/Assets/"..name)
+    end)
 end
 
 -- Keeps a drag bound to the input object that began it.  This is important on
