@@ -3,6 +3,7 @@ local Assets = {
     ["logo.jpg"] = "nil",
 }
 
+-- Lucide is loaded once; all UI icons use the asset returned by GetAsset(name).
 local Lucide = loadstring(game:HttpGet("https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"))()
 
 local Library = {
@@ -47,6 +48,9 @@ for name,_ in pairs(Assets) do
     Assets[name] = getcustomasset("Averlik Hub/Assets/"..name)
 end
 
+-- Keeps a drag bound to the input object that began it.  This is important on
+-- touch screens: a second finger scrolling a page must not move a slider,
+-- colour picker, resize handle, or window being controlled by the first one.
 local function trackPointerDrag(owner, target, began, moved, ended)
     local activeInput = nil
 
@@ -96,6 +100,8 @@ Control.__index = Control
 local Configurations = {}
 Configurations.__index = Configurations
 
+-- Keeps executor-specific behavior at the edge of the library. The UI itself
+-- only receives a normal Instance parent and remains usable in PlayerGui.
 local ExecutorRuntime = {}
 ExecutorRuntime.__index = ExecutorRuntime
 
@@ -174,6 +180,8 @@ local Theme = {
     SectionTitle = Color3.fromRGB(241, 241, 242),
 }
 
+-- The exit transition is intentionally shorter, so repeated GUI toggles feel
+-- responsive while the first entrance can stay more deliberate.
 local WINDOW_TRANSITION_DURATION = 0.26
 local WINDOW_CLOSE_DURATION = 0.10
 local WINDOW_UNLOAD_DURATION = 0.52
@@ -2474,10 +2482,24 @@ function Section:AddColorPicker(options)
     local descriptionSource = options.Description or ""
     local title = self.Window:_resolveLocalizedText(titleSource)
     local description = self.Window:_resolveLocalizedText(descriptionSource)
-    local value = options.Default or options.Value or self.Window.Theme.Accent
-    if typeof(value) ~= "Color3" then
-        value = self.Window.Theme.Accent
+
+    local maxColors = math.max(1, math.floor(tonumber(options.MaxColors or options.MaximumColors) or 1))
+    local multiple = maxColors > 1
+    local initialValue = options.Default or options.Value or self.Window.Theme.Accent
+    local colors = {}
+    if multiple and type(initialValue) == "table" then
+        for _, initialColor in ipairs(initialValue) do
+            if typeof(initialColor) == "Color3" and #colors < maxColors then
+                table.insert(colors, initialColor)
+            end
+        end
+    elseif typeof(initialValue) == "Color3" then
+        table.insert(colors, initialValue)
     end
+    if #colors == 0 then
+        table.insert(colors, self.Window.Theme.Accent)
+    end
+
     local closedHeight = description ~= "" and 57 or 43
     local frame = self:_row(closedHeight)
     frame.ClipsDescendants = true
@@ -2500,17 +2522,41 @@ function Section:AddColorPicker(options)
         })
         bindThemeColor(descriptionLabel, "TextColor3", "MutedText")
     end
-    local swatch = button(frame, {
-        BackgroundColor3 = value,
+
+    -- The header grows to the left. The add button always remains immediately
+    -- to the left of the active colour swatches.
+    local headerControls = new("Frame", {
         AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
         Position = UDim2.new(1, -10, 0, closedHeight / 2),
-        Size = UDim2.fromOffset(37, 22),
-        Text = "",
+        Size = UDim2.fromOffset(37, 24),
+        Parent = frame,
     })
-    preserveControlColor(swatch)
-    corner(swatch, 5) -- тут
-    local glow = uiShadow(swatch, value, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
-    preserveControlColor(glow)
+    local addButton = button(headerControls, {
+        BackgroundColor3 = self.Window.Theme.SurfacePressed,
+        Size = UDim2.fromOffset(25, 22),
+        Text = "+",
+        TextColor3 = self.Window.Theme.Text,
+        TextSize = 17,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        Visible = multiple,
+    })
+    bindThemeColor(addButton, "BackgroundColor3", "SurfacePressed")
+    bindThemeColor(addButton, "TextColor3", "Text")
+    corner(addButton, 5)
+    bindThemeColor(stroke(addButton, self.Window.Theme.Border, 1, 0.45), "Color", "Border")
+    addHover(
+        addButton,
+        self.Window.Theme,
+        function(currentTheme)
+            return currentTheme.SurfacePressed
+        end,
+        function(currentTheme)
+            return currentTheme.SurfacePressed:Lerp(Color3.fromRGB(255, 255, 255), 0.10)
+        end
+    )
 
     local pickerHeight = 88
     local pickerPanel = new("Frame", {
@@ -2529,7 +2575,7 @@ function Section:AddColorPicker(options)
         Parent = pickerPanel,
     })
     preserveControlColor(colorPlane)
-    corner(colorPlane, 6) -- тут
+    corner(colorPlane, 6)
     local saturationLayer = new("Frame", {
         BackgroundColor3 = Color3.fromRGB(255, 255, 255),
         BorderSizePixel = 0,
@@ -2644,32 +2690,51 @@ function Section:AddColorPicker(options)
     local control = self:_newControl(titleSource, descriptionSource, frame, options)
     control._titleLabel = titleLabel
     control._descriptionLabel = descriptionLabel
-    control.Value = value
+    control.MaxColors = maxColors
+    control.SelectedColor = 1
     control._callbacks = type(options.Callback) == "function" and { options.Callback } or {}
+
+    local selectedIndex = 1
     local open = false
-    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
-        if hasDescription then
-            closedHeight = 29 + descriptionHeight + 11
-            pickerPanel.Position = UDim2.fromOffset(10, closedHeight + 4)
-            swatch.Position = UDim2.new(1, -10, 0, closedHeight / 2)
-        else
-            closedHeight = 43
-            pickerPanel.Position = UDim2.fromOffset(10, closedHeight + 4)
-            swatch.Position = UDim2.new(1, -10, 0, closedHeight / 2)
+    local swatchWidgets = {}
+    local hsvStates = {}
+    local swatchRemovalPending = false
+    local headerInset = 66
+    local swatchWidth = multiple and 30 or 37
+    local swatchSpacing = 6
+
+    local function copyColors()
+        local result = {}
+        for index, color in ipairs(colors) do
+            result[index] = color
         end
-        if hasDescription then
-            titleLabel.Size = UDim2.new(1, -66, 0, 22)
-            titleLabel.Position = UDim2.fromOffset(10, 8)
-            descriptionLabel.Size = UDim2.new(1, -66, 0, descriptionHeight)
-            descriptionLabel.Position = UDim2.fromOffset(10, 29)
-            frame.Size = UDim2.new(1, 0, 0, open and closedHeight + 124 or closedHeight)
-        else
-            titleLabel.Size = UDim2.new(1, -66, 0, 22)
-            titleLabel.Position = UDim2.fromOffset(10, 10)
-            frame.Size = UDim2.new(1, 0, 0, open and closedHeight + 124 or closedHeight)
+        return result
+    end
+
+    local function colorState(color, previous)
+        local hue, saturation, brightness = Color3.toHSV(color)
+        if previous then
+            if brightness <= 0.00001 then
+                hue = previous.Hue
+                saturation = previous.Saturation
+            elseif saturation <= 0.00001 then
+                hue = previous.Hue
+            end
         end
-    end)
-    local hue, saturation, brightness = Color3.toHSV(value)
+        return {
+            Hue = hue,
+            Saturation = saturation,
+            Brightness = brightness,
+        }
+    end
+
+    for index, color in ipairs(colors) do
+        hsvStates[index] = colorState(color)
+    end
+
+    local function currentState()
+        return hsvStates[selectedIndex]
+    end
 
     local function colorToHex(color)
         return string.format("#%02X%02X%02X",
@@ -2692,44 +2757,307 @@ function Section:AddColorPicker(options)
         )
     end
 
+    local function publicValue()
+        if multiple then
+            return copyColors()
+        end
+        return colors[1]
+    end
+
+    local function syncControlValue()
+        control.Value = multiple and colors or colors[1]
+        control.SelectedColor = selectedIndex
+    end
+
+    local function emitValue()
+        syncControlValue()
+        local value = publicValue()
+        for _, callback in ipairs(control._callbacks) do
+            safeCall(callback, value, selectedIndex)
+        end
+    end
+
+    local function reflowHeader()
+        local canAdd = multiple and #colors < maxColors
+        addButton.Visible = canAdd
+        local x = 0
+        if canAdd then
+            addButton.Position = UDim2.fromOffset(0, 1)
+            x = 25 + swatchSpacing
+        end
+        for index, widget in ipairs(swatchWidgets) do
+            widget.Button.Position = UDim2.fromOffset(x, 1)
+            widget.Button.Size = UDim2.fromOffset(swatchWidth, 22)
+            x = x + swatchWidth + swatchSpacing
+        end
+        local totalWidth = math.max(swatchWidth, x > 0 and x - swatchSpacing or 0)
+        headerControls.Size = UDim2.fromOffset(totalWidth, 24)
+        headerInset = totalWidth + 22
+        titleLabel.Size = UDim2.new(1, -headerInset, 0, 22)
+        if descriptionLabel then
+            descriptionLabel.Size = UDim2.new(1, -headerInset, 0, descriptionLabel.Size.Y.Offset)
+        end
+    end
+
     local function render()
-        local color = control.Value
-        swatch.BackgroundColor3 = color
-        glow.Color = color
-        colorPlane.BackgroundColor3 = Color3.fromHSV(hue, 1, 1)
-        colorSelector.Position = UDim2.new(saturation, 0, 1 - brightness, 0)
-        hueSelector.Position = UDim2.new(0.5, 0, hue, 0)
+        local state = currentState()
+        local color = colors[selectedIndex]
+        if not state or not color then
+            return
+        end
+        for index, widget in ipairs(swatchWidgets) do
+            local widgetColor = colors[index]
+            widget.Button.BackgroundColor3 = widgetColor
+            widget.Glow.Color = widgetColor
+            -- Every swatch, including colours added at runtime, keeps its own glow.
+            widget.Glow.Enabled = true
+        end
+        colorPlane.BackgroundColor3 = Color3.fromHSV(state.Hue, 1, 1)
+        colorSelector.Position = UDim2.new(state.Saturation, 0, 1 - state.Brightness, 0)
+        hueSelector.Position = UDim2.new(0.5, 0, state.Hue, 0)
         hexInput.Text = colorToHex(color)
     end
 
     local function setOpen(nextOpen)
-        open = nextOpen
-        pickerPanel.Visible = nextOpen
-        tween(frame, 0.16, { Size = UDim2.new(1, 0, 0, nextOpen and closedHeight + 124 or closedHeight) })
+        open = nextOpen == true
+        pickerPanel.Visible = open
+        tween(frame, 0.16, { Size = UDim2.new(1, 0, 0, open and closedHeight + 124 or closedHeight) })
+        if open then
+            control:_scrollIntoView()
+        end
     end
-    local function setHSV(nextHue, nextSaturation, nextBrightness, silent)
-        hue = math.clamp(nextHue, 0, 1)
-        saturation = math.clamp(nextSaturation, 0, 1)
-        brightness = math.clamp(nextBrightness, 0, 1)
-        control.Value = Color3.fromHSV(hue, saturation, brightness)
+
+    local function selectColor(index, openPicker)
+        index = math.floor(tonumber(index) or 0)
+        if index < 1 or index > #colors then
+            return false
+        end
+        selectedIndex = index
+        syncControlValue()
+        render()
+        if openPicker ~= nil then
+            setOpen(openPicker)
+        end
+        return true
+    end
+
+    local function createSwatch(index)
+        local swatch = button(headerControls, {
+            BackgroundColor3 = colors[index],
+            Position = UDim2.fromOffset(0, 1),
+            Size = UDim2.fromOffset(swatchWidth, 22),
+            Text = "",
+        })
+        preserveControlColor(swatch)
+        corner(swatch, 5)
+        local swatchGlow = uiShadow(swatch, colors[index], 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
+        preserveControlColor(swatchGlow)
+        local widget = {
+            Button = swatch,
+            Glow = swatchGlow,
+        }
+        swatchWidgets[index] = widget
+        swatch.Activated:Connect(function()
+            local wasSelected = selectedIndex == index
+            selectColor(index)
+            if wasSelected then
+                setOpen(not open)
+            else
+                setOpen(true)
+            end
+        end)
+        swatch.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton2 then
+                control:RemoveColor(index)
+            end
+        end)
+        return widget
+    end
+
+    local function animateSwatchIn(widget)
+        local swatch = widget.Button
+        swatch.BackgroundTransparency = 1
+        widget.Glow.Transparency = 1
+        task.defer(function()
+            if not swatch.Parent then
+                return
+            end
+            tween(swatch, 0.14, { BackgroundTransparency = 0 })
+            tween(widget.Glow, 0.14, { Transparency = 0.42 })
+        end)
+    end
+
+    local function rebuildSwatches()
+        for _, widget in ipairs(swatchWidgets) do
+            widget.Button:Destroy()
+        end
+        table.clear(swatchWidgets)
+        for index = 1, #colors do
+            createSwatch(index)
+        end
+        reflowHeader()
+        render()
+    end
+
+    bindWrappedDescription(control, descriptionLabel, function(descriptionHeight, hasDescription)
+        if hasDescription then
+            closedHeight = 29 + descriptionHeight + 11
+            pickerPanel.Position = UDim2.fromOffset(10, closedHeight + 4)
+            headerControls.Position = UDim2.new(1, -10, 0, closedHeight / 2)
+        else
+            closedHeight = 43
+            pickerPanel.Position = UDim2.fromOffset(10, closedHeight + 4)
+            headerControls.Position = UDim2.new(1, -10, 0, closedHeight / 2)
+        end
+        if hasDescription then
+            titleLabel.Size = UDim2.new(1, -headerInset, 0, 22)
+            titleLabel.Position = UDim2.fromOffset(10, 8)
+            descriptionLabel.Size = UDim2.new(1, -headerInset, 0, descriptionHeight)
+            descriptionLabel.Position = UDim2.fromOffset(10, 29)
+            frame.Size = UDim2.new(1, 0, 0, open and closedHeight + 124 or closedHeight)
+        else
+            titleLabel.Size = UDim2.new(1, -headerInset, 0, 22)
+            titleLabel.Position = UDim2.fromOffset(10, 10)
+            frame.Size = UDim2.new(1, 0, 0, open and closedHeight + 124 or closedHeight)
+        end
+    end)
+
+    local function setSelectedHSV(nextHue, nextSaturation, nextBrightness, silent)
+        local state = currentState()
+        state.Hue = math.clamp(nextHue, 0, 1)
+        state.Saturation = math.clamp(nextSaturation, 0, 1)
+        state.Brightness = math.clamp(nextBrightness, 0, 1)
+        colors[selectedIndex] = Color3.fromHSV(state.Hue, state.Saturation, state.Brightness)
+        syncControlValue()
         render()
         if not silent then
-            control:_emit(control.Value)
+            emitValue()
         end
         return control
     end
-    function control:SetValue(nextColor, silent)
-        if typeof(nextColor) ~= "Color3" then
+
+    function control:GetValue()
+        return publicValue()
+    end
+
+    function control:GetColors()
+        return copyColors()
+    end
+
+    function control:GetColor(index)
+        return colors[math.floor(tonumber(index) or 0)]
+    end
+
+    function control:GetSelectedIndex()
+        return selectedIndex
+    end
+
+    function control:SelectColor(index, openPicker)
+        selectColor(index, openPicker)
+        return self
+    end
+
+    function control:SetColor(index, nextColor, silent)
+        index = math.floor(tonumber(index) or 0)
+        if index < 1 or index > #colors or typeof(nextColor) ~= "Color3" then
             return self
         end
-        local nextHue, nextSaturation, nextBrightness = Color3.toHSV(nextColor)
-        if nextBrightness <= 0.00001 then
-            nextHue = hue
-            nextSaturation = saturation
-        elseif nextSaturation <= 0.00001 then
-            nextHue = hue
+        colors[index] = nextColor
+        hsvStates[index] = colorState(nextColor, hsvStates[index])
+        syncControlValue()
+        render()
+        if not silent then
+            emitValue()
         end
-        return setHSV(nextHue, nextSaturation, nextBrightness, silent)
+        return self
+    end
+
+    function control:AddColor(nextColor, silent)
+        if not multiple or #colors >= maxColors then
+            return self
+        end
+        if typeof(nextColor) ~= "Color3" then
+            nextColor = colors[selectedIndex] or control.Section.Window.Theme.Accent
+        end
+        table.insert(colors, nextColor)
+        table.insert(hsvStates, colorState(nextColor, currentState()))
+        selectedIndex = #colors
+        local newWidget = createSwatch(selectedIndex)
+        reflowHeader()
+        animateSwatchIn(newWidget)
+        syncControlValue()
+        render()
+        setOpen(true)
+        if not silent then
+            emitValue()
+        end
+        return self
+    end
+
+    function control:RemoveColor(index, silent)
+        index = math.floor(tonumber(index) or 0)
+        -- Keep one colour available, and only allow removal for multi-colour pickers.
+        if swatchRemovalPending or not multiple or #colors <= 1 or index < 1 or index > #colors then
+            return self
+        end
+
+        local removedWidget = swatchWidgets[index]
+        if not removedWidget then
+            return self
+        end
+        swatchRemovalPending = true
+        tween(removedWidget.Button, 0.12, { BackgroundTransparency = 1 })
+        tween(removedWidget.Glow, 0.12, { Transparency = 1 })
+
+        task.delay(0.12, function()
+            if removedWidget.Button.Parent then
+                removedWidget.Button:Destroy()
+            end
+            table.remove(colors, index)
+            table.remove(hsvStates, index)
+            selectedIndex = math.clamp(index, 1, #colors)
+            rebuildSwatches()
+            syncControlValue()
+            render()
+            swatchRemovalPending = false
+            if not silent then
+                emitValue()
+            end
+        end)
+        return self
+    end
+
+    function control:SetValue(nextValue, silent)
+        local nextColors = {}
+        if typeof(nextValue) == "Color3" then
+            nextColors[1] = nextValue
+        elseif multiple and type(nextValue) == "table" then
+            for _, nextColor in ipairs(nextValue) do
+                if typeof(nextColor) == "Color3" and #nextColors < maxColors then
+                    table.insert(nextColors, nextColor)
+                end
+            end
+        end
+        if #nextColors == 0 then
+            return self
+        end
+
+        colors = nextColors
+        hsvStates = {}
+        for index, nextColor in ipairs(colors) do
+            hsvStates[index] = colorState(nextColor)
+        end
+        selectedIndex = math.clamp(selectedIndex, 1, #colors)
+        rebuildSwatches()
+        syncControlValue()
+        if not silent then
+            emitValue()
+        end
+        return self
+    end
+
+    control._getConfigValue = function()
+        return publicValue()
     end
 
     local function updatePlane(position)
@@ -2739,16 +3067,20 @@ function Section:AddColorPicker(options)
         end
         local nextSaturation = math.clamp((position.X - colorPlane.AbsolutePosition.X) / size.X, 0, 1)
         local nextBrightness = 1 - math.clamp((position.Y - colorPlane.AbsolutePosition.Y) / size.Y, 0, 1)
-        setHSV(hue, nextSaturation, nextBrightness)
+        local state = currentState()
+        setSelectedHSV(state.Hue, nextSaturation, nextBrightness)
     end
+
     local function updateHue(position)
         local height = hueBar.AbsoluteSize.Y
         if height <= 0 then
             return
         end
         local nextHue = math.clamp((position.Y - hueBar.AbsolutePosition.Y) / height, 0, 1)
-        setHSV(nextHue, saturation, brightness)
+        local state = currentState()
+        setSelectedHSV(nextHue, state.Saturation, state.Brightness)
     end
+
     trackPointerDrag(control, colorHitbox, function(input)
         updatePlane(input.Position)
     end, function(input)
@@ -2762,7 +3094,7 @@ function Section:AddColorPicker(options)
     control:_track(hexInput.FocusLost:Connect(function()
         local parsed = colorFromHex(hexInput.Text)
         if parsed then
-            control:SetValue(parsed)
+            control:SetColor(selectedIndex, parsed)
         else
             render()
         end
@@ -2770,13 +3102,14 @@ function Section:AddColorPicker(options)
     control:_track(hexInput.Focused:Connect(function()
         control:_scrollIntoView()
     end))
-    control:_track(swatch.Activated:Connect(function()
-        setOpen(not open)
+    control:_track(addButton.Activated:Connect(function()
+        control:AddColor()
     end))
-    render()
+
+    rebuildSwatches()
+    syncControlValue()
     return control
 end
-
 Section.AddSeparator = Section.AddDivider
 
 function Section:SetVisible(visible)
