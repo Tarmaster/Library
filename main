@@ -556,6 +556,18 @@ local function normalizeOptions(options)
     return type(options) == "table" and options or {}
 end
 
+-- TextLabel.TextSize expects a positive number.  Keep paragraph options
+-- forgiving (string numbers are accepted, invalid values fall back to the
+-- library defaults) so a malformed optional size cannot break control
+-- creation.
+local function normalizeTextSize(value, fallback)
+    local size = tonumber(value)
+    if not size or size <= 0 then
+        return fallback
+    end
+    return math.max(1, math.floor(size))
+end
+
 local function getGuiParent(preferredParent, useExecutorGui)
     return Runtime:ResolveParent(preferredParent, useExecutorGui)
 end
@@ -1129,36 +1141,360 @@ function Section:AddParagraph(options)
     local titleSource = options.Name or options.Title or "Paragraph"
     local contentSource = options.Content or options.Description or ""
     local title = self.Window:_resolveLocalizedText(titleSource)
-    local content = self.Window:_resolveLocalizedText(contentSource)
-    local frame = self:_row(65)
-    local titleLabel = text(frame, {
-        Text = title,
-        Font = Enum.Font.GothamBold,
-        TextSize = 12,
-        Size = UDim2.new(1, -18, 0, 20),
-        Position = UDim2.fromOffset(10, 7),
+    local content = type(contentSource) == "table" and self.Window:_resolveLocalizedText(contentSource) or self.Window:_resolveLocalizedText(contentSource)
+
+    -- `TitleTextSize`/`DescriptionTextSize` are the explicit names.  The
+    -- shorter aliases keep the option pleasant to use and make the API
+    -- tolerant of the common `TitleSize`/`DescriptionSize` spelling.
+    local titleTextSize = normalizeTextSize(
+        options.TitleTextSize or options.TitleSize or options.NameTextSize,
+        12
+    )
+    local descriptionTextSize = normalizeTextSize(
+        options.DescriptionTextSize
+            or options.DescriptionSize
+            or options.ContentTextSize
+            or options.FieldTextSize,
+        10
+    )
+    -- Reserve enough room for a larger custom title while retaining the
+    -- original 20px row for the default 12px title.
+    local titleHeight = math.max(20, math.ceil(titleTextSize + 6))
+    local fieldNameHeight = math.max(15, math.ceil(titleTextSize + 3))
+
+    -- A paragraph may contain several fields.  `Fields` is the most explicit
+    -- form (`{ {Name = "...", Description = "..."}, ... }`), while
+    -- `Descriptions`/`Contents` are convenient shorthand for body-only
+    -- columns.  The old single-string Content/Description form is unchanged.
+    local rawFields = options.Fields or options.Descriptions or options.Contents
+    local fields = {}
+    if type(options.Names) == "table" and #options.Names > 0 then
+        for index, value in ipairs(options.Names) do
+            table.insert(fields, {
+                Name = self.Window:_resolveLocalizedText(value),
+                Description = type(options.Descriptions) == "table"
+                    and self.Window:_resolveLocalizedText(options.Descriptions[index] or "") or "",
+            })
+        end
+    elseif type(rawFields) == "table" and (#rawFields > 0) then
+        for index, value in ipairs(rawFields) do
+            local fieldName, fieldDescription
+            if type(value) == "table" then
+                fieldName = value.Name or value.Title or value.Label
+                fieldDescription = value.Description or value.Content or value.Text or ""
+            else
+                fieldDescription = value
+            end
+            table.insert(fields, {
+                Name = fieldName ~= nil and self.Window:_resolveLocalizedText(fieldName) or "",
+                Description = self.Window:_resolveLocalizedText(fieldDescription),
+            })
+        end
+    else
+        fields = {{ Description = content, Name = "" }}
+    end
+
+    local fieldCount = math.max(1, #fields)
+    local hasTitle = title ~= ""
+    local centerTitle = options.CenterTitle == true
+        or options.TitleCentered == true
+        or options.TitleCenter == true
+    local frame = self:_row(fieldCount > 1 and 65 or 65)
+    -- Keep the paragraph's border and glow on the gray surface itself.  The
+    -- text host is transparent, so putting UIShadow there makes the halo
+    -- follow only the text area instead of the whole paragraph card.
+    local frameStroke = stroke(frame, self.Window.Theme.Border, 1, 0.48)
+    bindThemeColor(frameStroke, "Color", "Border")
+    local titleLabel
+    local function createTitleLabel(value)
+        if titleLabel or value == "" then
+            return
+        end
+        titleLabel = text(frame, {
+            Text = value,
+            Font = Enum.Font.GothamBold,
+            TextSize = titleTextSize,
+            TextXAlignment = centerTitle and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left,
+            Size = UDim2.new(1, -18, 0, titleHeight),
+            Position = UDim2.fromOffset(10, 4),
+        })
+    end
+    local function removeTitleLabel()
+        if titleLabel then
+            titleLabel:Destroy()
+            titleLabel = nil
+        end
+    end
+    if hasTitle then
+        createTitleLabel(title)
+    end
+    local fieldLabels = {}
+    local fieldBodies = {}
+    local fieldColumns = {}
+    local fieldAlignments = {}
+    local centered = options.Center == true or options.CenterText == true or options.TextCentered == true
+    local fieldHost = new("Frame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, -20, 1, -(hasTitle and titleHeight + 9 or 15)),
+        Position = UDim2.fromOffset(10, hasTitle and titleHeight + 2 or 6),
+        Parent = frame,
     })
-    local body = text(frame, {
-        Text = content,
-        TextSize = 10,
-        TextColor3 = self.Window.Theme.MutedText,
-        TextWrapped = true,
-        TextYAlignment = Enum.TextYAlignment.Top,
-        Size = UDim2.new(1, -20, 0, 32),
-        Position = UDim2.fromOffset(10, 27),
-    })
-    bindThemeColor(body, "TextColor3", "MutedText")
-    local control = self:_newControl(titleSource, contentSource, frame)
+    for index, field in ipairs(fields) do
+        local column = new("Frame", {
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Size = UDim2.new(1 / fieldCount, 0, 1, 0),
+            Position = UDim2.new((index - 1) / fieldCount, 0, 0, 0),
+            Parent = fieldHost,
+        })
+        local alignment
+        if centered then
+            alignment = Enum.TextXAlignment.Center
+        elseif fieldCount > 1 then
+            alignment = index == 1 and Enum.TextXAlignment.Left
+                or (index == fieldCount and Enum.TextXAlignment.Right or Enum.TextXAlignment.Center)
+        else
+            alignment = Enum.TextXAlignment.Left
+        end
+        fieldColumns[index] = column
+        fieldAlignments[index] = alignment
+        local nameLabel
+        if field.Name ~= "" then
+            nameLabel = text(column, {
+                Text = field.Name,
+                Font = Enum.Font.GothamMedium,
+                -- Field names intentionally match the paragraph title size.
+                TextSize = titleTextSize,
+                TextColor3 = self.Window.Theme.Text,
+                TextWrapped = true,
+                TextYAlignment = Enum.TextYAlignment.Top,
+                TextXAlignment = alignment,
+                Size = UDim2.new(1, -4, 0, fieldNameHeight),
+                Position = UDim2.fromOffset(2, 0),
+            })
+            bindThemeColor(nameLabel, "TextColor3", "Text")
+        end
+        local body = text(column, {
+            Text = field.Description,
+            TextSize = descriptionTextSize,
+            TextColor3 = self.Window.Theme.MutedText,
+            TextWrapped = true,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextXAlignment = alignment,
+            Size = UDim2.new(1, -4, 0, 20),
+            Position = UDim2.fromOffset(2, nameLabel and fieldNameHeight + 1 or 0),
+        })
+        bindThemeColor(body, "TextColor3", "MutedText")
+        -- Assign by index rather than table.insert: fields without a name
+        -- must not shift the labels belonging to subsequent fields.
+        fieldLabels[index] = nameLabel
+        fieldBodies[index] = body
+    end
+
+    local function createFieldNameLabel(index)
+        if fieldLabels[index] or not fieldColumns[index] or fields[index].Name == "" then
+            return fieldLabels[index]
+        end
+        local nameLabel = text(fieldColumns[index], {
+            Text = fields[index].Name,
+            Font = Enum.Font.GothamMedium,
+            TextSize = titleTextSize,
+            TextColor3 = self.Window.Theme.Text,
+            TextWrapped = true,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextXAlignment = fieldAlignments[index],
+            Size = UDim2.new(1, -4, 0, fieldNameHeight),
+            Position = UDim2.fromOffset(2, 0),
+        })
+        bindThemeColor(nameLabel, "TextColor3", "Text")
+        fieldLabels[index] = nameLabel
+        return nameLabel
+    end
+
+    local controlDescription = content
+    if #fields > 1 then
+        local values = {}
+        for _, field in ipairs(fields) do
+            table.insert(values, (field.Name ~= "" and field.Name .. " " or "") .. field.Description)
+        end
+        controlDescription = table.concat(values, " ")
+    end
+    local control = self:_newControl(titleSource, controlDescription, frame)
     control._titleLabel = titleLabel
-    control._descriptionLabel = body
-    control.Value = content
-    bindWrappedDescription(control, body, function(contentHeight, hasContent)
-        frame.Size = UDim2.new(1, 0, 0, hasContent and 33 + contentHeight or 31)
-        body.Size = UDim2.new(1, -20, 0, contentHeight)
-    end)
+    control._descriptionLabel = fieldBodies[1]
+    control.Value = controlDescription
+    local function refreshFields()
+        local maxHeight = 0
+        local hostWidth = fieldHost.AbsoluteSize.X
+        local columnWidth = math.max(1, hostWidth / fieldCount - 4)
+        for index, field in ipairs(fields) do
+            local nameLabel, body = fieldLabels[index], fieldBodies[index]
+            local nameHeight = 0
+            if nameLabel then
+                nameHeight = math.max(15, math.ceil(TextService:GetTextSize(nameLabel.Text, nameLabel.TextSize, nameLabel.Font, Vector2.new(columnWidth, 10000)).Y))
+                nameLabel.Size = UDim2.new(1, -4, 0, nameHeight)
+            end
+            local bodyHeight = 0
+            if field.Description ~= "" then
+                bodyHeight = math.max(15, math.ceil(TextService:GetTextSize(body.Text, body.TextSize, body.Font, Vector2.new(columnWidth, 10000)).Y))
+            end
+            body.Position = UDim2.fromOffset(2, nameHeight + (nameLabel and 1 or 0))
+            body.Size = UDim2.new(1, -4, 0, bodyHeight)
+            maxHeight = math.max(maxHeight, nameHeight + (nameLabel and 1 or 0) + bodyHeight)
+        end
+        local topOffset = titleLabel and titleHeight + 2 or 6
+        fieldHost.Position = UDim2.fromOffset(10, topOffset)
+        fieldHost.Size = UDim2.new(1, -20, 0, maxHeight)
+        frame.Size = UDim2.new(1, 0, 0, math.max(31, topOffset + 4 + maxHeight))
+    end
+    control._refreshDescriptionLayout = refreshFields
+    control:_track(fieldHost:GetPropertyChangedSignal("AbsoluteSize"):Connect(refreshFields))
+    for _, label in ipairs(fieldBodies) do
+        control:_track(label:GetPropertyChangedSignal("Text"):Connect(refreshFields))
+    end
+    task.defer(refreshFields)
+
+    -- Paragraph titles can be removed entirely by setting an empty string;
+    -- restoring a non-empty title recreates the label and its vertical space.
+    local inheritedSetTitle = control.SetTitle
+    function control:SetTitle(value)
+        inheritedSetTitle(self, value)
+        local resolved = self.Name or ""
+        if resolved == "" then
+            removeTitleLabel()
+            self._titleLabel = nil
+        else
+            createTitleLabel(resolved)
+            if titleLabel then
+                titleLabel.Text = resolved
+                titleLabel.TextXAlignment = centerTitle and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left
+            end
+            self._titleLabel = titleLabel
+        end
+        refreshFields()
+        return self
+    end
+    function control:_refreshLocalizedText()
+        self:SetTitle(self._nameSource)
+    end
+    if options.Glow == true then
+        local glow = uiShadow(frame, self.Window.Theme.Accent, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
+        bindThemeColor(glow, "Color", "Accent")
+        glow.Enabled = true
+        frameStroke.Color = self.Window.Theme.Accent
+        frameStroke.Transparency = 0.18
+        control._paragraphGlow = glow
+        control._paragraphStroke = frameStroke
+        control._refreshTheme = function()
+            local accent = control.Section.Window.Theme.Accent
+            glow.Color = accent
+            frameStroke.Color = accent
+            frameStroke.Transparency = 0.18
+        end
+    end
+    local inheritedSetDescription = control.SetDescription
+    function control:SetDescription(value)
+        inheritedSetDescription(self, value)
+        if fields[1] then
+            fields[1].Description = self.Section.Window:_resolveLocalizedText(value)
+            fieldBodies[1].Text = fields[1].Description
+            self.Description = fields[1].Description
+            self.Value = fields[1].Description
+            refreshFields()
+        end
+        return self
+    end
     function control:SetContent(value)
         self:SetDescription(value)
         self.Value = self.Description
+        return self
+    end
+    -- Update one field without rebuilding the paragraph.  `index` may be the
+    -- numeric field position or the current field name.  A scalar updates the
+    -- description; a table can update both `{ Name = ..., Description = ... }`.
+    local function resolveFieldIndex(index)
+        if type(index) == "number" then
+            return index
+        end
+        if type(index) == "string" then
+            for fieldIndex, field in ipairs(fields) do
+                if field.Name == index then
+                    return fieldIndex
+                end
+            end
+        end
+        return nil
+    end
+    local function refreshCombinedFieldValue()
+        local combined = {}
+        for _, field in ipairs(fields) do
+            table.insert(combined, (field.Name ~= "" and field.Name .. " " or "") .. field.Description)
+        end
+        self.Description = table.concat(combined, " ")
+        self._descriptionSource = self.Description
+        self.Value = self.Description
+        self._searchText = componentSearchText(self.Name, self.Description)
+    end
+    function control:SetField(index, value, description)
+        local fieldIndex = resolveFieldIndex(index)
+        assert(fieldIndex and fields[fieldIndex] and fieldBodies[fieldIndex], "SetField expects a valid field index or name")
+        local field = fields[fieldIndex]
+        local nextName, nextDescription
+        if type(value) == "table" then
+            nextName = value.Name
+            if nextName == nil then
+                nextName = value.Title or value.Label
+            end
+            nextDescription = value.Description
+            if nextDescription == nil then
+                nextDescription = value.Content or value.Text
+            end
+        elseif description ~= nil then
+            nextName, nextDescription = value, description
+        else
+            nextDescription = value
+        end
+        if nextName ~= nil then
+            field.Name = self.Section.Window:_resolveLocalizedText(nextName)
+            if field.Name == "" then
+                if fieldLabels[fieldIndex] then
+                    fieldLabels[fieldIndex]:Destroy()
+                    fieldLabels[fieldIndex] = nil
+                end
+            else
+                local nameLabel = createFieldNameLabel(fieldIndex)
+                if nameLabel then
+                    nameLabel.Text = field.Name
+                end
+            end
+        end
+        if nextDescription ~= nil then
+            field.Description = self.Section.Window:_resolveLocalizedText(nextDescription)
+            fieldBodies[fieldIndex].Text = field.Description
+        end
+        refreshCombinedFieldValue()
+        refreshFields()
+        return self
+    end
+    control.Set = control.SetField
+    function control:SetFields(values)
+        assert(type(values) == "table", "SetFields expects a table")
+        for index, value in ipairs(values) do
+            if fields[index] and fieldBodies[index] then
+                fields[index].Description = self.Section.Window:_resolveLocalizedText(type(value) == "table" and (value.Description or value.Content or value.Text or "") or value)
+                fieldBodies[index].Text = fields[index].Description
+            end
+        end
+        local combined = {}
+        for _, field in ipairs(fields) do
+            table.insert(combined, (field.Name ~= "" and field.Name .. " " or "") .. field.Description)
+        end
+        self.Description = table.concat(combined, " ")
+        self._descriptionSource = self.Description
+        self.Value = self.Description
+        self._searchText = componentSearchText(self.Name, self.Description)
+        refreshFields()
         return self
     end
     control.SetValue = control.SetContent
