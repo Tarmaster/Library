@@ -237,6 +237,18 @@ local function localizedValuesEqual(left, right)
     return false
 end
 
+local function isLocalizedPair(value)
+    if type(value) ~= "table" or (value[1] == nil and value[2] == nil) then
+        return false
+    end
+    return value.Name == nil
+        and value.Title == nil
+        and value.Label == nil
+        and value.Description == nil
+        and value.Content == nil
+        and value.Text == nil
+end
+
 local function cloneTable(source)
     local result = {}
     for key, value in pairs(source) do
@@ -968,15 +980,21 @@ function Control:_refreshLocalization()
     if self._titleLabel then
         self._titleLabel.Text = self.Name
     end
+    if self._refreshLocalizedText then
+        -- Custom refreshers may be methods (paragraphs) or plain closures;
+        -- passing the control keeps both forms compatible and gives method
+        -- implementations access to their source values.
+        self:_refreshLocalizedText()
+    end
+    -- Custom refreshers (notably paragraphs with multiple fields) can replace
+    -- Description and the label text.  Apply visibility and layout afterwards
+    -- so the first language switch measures the translated text as well.
     if self._descriptionLabel then
         self._descriptionLabel.Text = self.Description
         self._descriptionLabel.Visible = self.Description ~= ""
     end
     if self._refreshDescriptionLayout then
         self:_refreshDescriptionLayout()
-    end
-    if self._refreshLocalizedText then
-        self._refreshLocalizedText()
     end
     self._searchText = componentSearchText(self.Name, self.Description)
 end
@@ -1170,28 +1188,38 @@ function Section:AddParagraph(options)
     local fields = {}
     if type(options.Names) == "table" and #options.Names > 0 then
         for index, value in ipairs(options.Names) do
+            local descriptionSource = type(options.Descriptions) == "table"
+                and options.Descriptions[index] or ""
             table.insert(fields, {
+                NameSource = value,
+                DescriptionSource = descriptionSource,
                 Name = self.Window:_resolveLocalizedText(value),
-                Description = type(options.Descriptions) == "table"
-                    and self.Window:_resolveLocalizedText(options.Descriptions[index] or "") or "",
+                Description = self.Window:_resolveLocalizedText(descriptionSource),
             })
         end
     elseif type(rawFields) == "table" and (#rawFields > 0) then
         for index, value in ipairs(rawFields) do
-            local fieldName, fieldDescription
-            if type(value) == "table" then
-                fieldName = value.Name or value.Title or value.Label
-                fieldDescription = value.Description or value.Content or value.Text or ""
+            local fieldNameSource, fieldDescriptionSource
+            if type(value) == "table" and not isLocalizedPair(value) then
+                fieldNameSource = value.Name or value.Title or value.Label
+                fieldDescriptionSource = value.Description or value.Content or value.Text or ""
             else
-                fieldDescription = value
+                fieldDescriptionSource = value
             end
             table.insert(fields, {
-                Name = fieldName ~= nil and self.Window:_resolveLocalizedText(fieldName) or "",
-                Description = self.Window:_resolveLocalizedText(fieldDescription),
+                NameSource = fieldNameSource,
+                DescriptionSource = fieldDescriptionSource,
+                Name = fieldNameSource ~= nil and self.Window:_resolveLocalizedText(fieldNameSource) or "",
+                Description = self.Window:_resolveLocalizedText(fieldDescriptionSource),
             })
         end
     else
-        fields = {{ Description = content, Name = "" }}
+        fields = {{
+            NameSource = "",
+            DescriptionSource = contentSource,
+            Description = content,
+            Name = "",
+        }}
     end
 
     local fieldCount = math.max(1, #fields)
@@ -1323,7 +1351,28 @@ function Section:AddParagraph(options)
     local control = self:_newControl(titleSource, controlDescription, frame)
     control._titleLabel = titleLabel
     control._descriptionLabel = fieldBodies[1]
+    if #fields == 1 then
+        -- Keep the original localized body as the control source as well as on
+        -- the field.  This prevents the generic refresh pass from briefly
+        -- resolving the already-rendered English string on the first switch.
+        control._descriptionSource = fields[1].DescriptionSource
+    end
     control.Value = controlDescription
+    local function refreshCombinedFieldValue()
+        local combined = {}
+        for _, field in ipairs(fields) do
+            table.insert(combined, (field.Name ~= "" and field.Name .. " " or "") .. field.Description)
+        end
+        -- A single-field paragraph displays only its body; field names are
+        -- metadata in that form.  Multiple fields use the combined value for
+        -- search/config state, matching the original paragraph behaviour.
+        control.Description = #fields == 1 and fields[1].Description or table.concat(combined, " ")
+        if #fields == 1 then
+            control._descriptionSource = fields[1].DescriptionSource
+        end
+        control.Value = control.Description
+        control._searchText = componentSearchText(control.Name, control.Description)
+    end
     local function refreshFields()
         local maxHeight = 0
         local hostWidth = fieldHost.AbsoluteSize.X
@@ -1355,8 +1404,6 @@ function Section:AddParagraph(options)
     end
     task.defer(refreshFields)
 
-    -- Paragraph titles can be removed entirely by setting an empty string;
-    -- restoring a non-empty title recreates the label and its vertical space.
     local inheritedSetTitle = control.SetTitle
     function control:SetTitle(value)
         inheritedSetTitle(self, value)
@@ -1375,8 +1422,27 @@ function Section:AddParagraph(options)
         refreshFields()
         return self
     end
-    function control:_refreshLocalizedText()
-        self:SetTitle(self._nameSource)
+    control._refreshLocalizedText = function()
+        control:SetTitle(control._nameSource)
+        for index, field in ipairs(fields) do
+            field.Name = control.Section.Window:_resolveLocalizedText(field.NameSource)
+            field.Description = control.Section.Window:_resolveLocalizedText(field.DescriptionSource)
+
+            if field.Name == "" then
+                if fieldLabels[index] then
+                    fieldLabels[index]:Destroy()
+                    fieldLabels[index] = nil
+                end
+            else
+                local nameLabel = createFieldNameLabel(index)
+                if nameLabel then
+                    nameLabel.Text = field.Name
+                end
+            end
+            fieldBodies[index].Text = field.Description
+        end
+        refreshCombinedFieldValue()
+        refreshFields()
     end
     if options.Glow == true then
         local glow = uiShadow(frame, self.Window.Theme.Accent, 0.42, 6, UDim2.new(), UDim2.fromOffset(1, 1))
@@ -1397,6 +1463,7 @@ function Section:AddParagraph(options)
     function control:SetDescription(value)
         inheritedSetDescription(self, value)
         if fields[1] then
+            fields[1].DescriptionSource = value
             fields[1].Description = self.Section.Window:_resolveLocalizedText(value)
             fieldBodies[1].Text = fields[1].Description
             self.Description = fields[1].Description
@@ -1426,22 +1493,12 @@ function Section:AddParagraph(options)
         end
         return nil
     end
-    local function refreshCombinedFieldValue()
-        local combined = {}
-        for _, field in ipairs(fields) do
-            table.insert(combined, (field.Name ~= "" and field.Name .. " " or "") .. field.Description)
-        end
-        self.Description = table.concat(combined, " ")
-        self._descriptionSource = self.Description
-        self.Value = self.Description
-        self._searchText = componentSearchText(self.Name, self.Description)
-    end
     function control:SetField(index, value, description)
         local fieldIndex = resolveFieldIndex(index)
         assert(fieldIndex and fields[fieldIndex] and fieldBodies[fieldIndex], "SetField expects a valid field index or name")
         local field = fields[fieldIndex]
         local nextName, nextDescription
-        if type(value) == "table" then
+        if type(value) == "table" and not isLocalizedPair(value) then
             nextName = value.Name
             if nextName == nil then
                 nextName = value.Title or value.Label
@@ -1456,6 +1513,7 @@ function Section:AddParagraph(options)
             nextDescription = value
         end
         if nextName ~= nil then
+            field.NameSource = nextName
             field.Name = self.Section.Window:_resolveLocalizedText(nextName)
             if field.Name == "" then
                 if fieldLabels[fieldIndex] then
@@ -1470,6 +1528,7 @@ function Section:AddParagraph(options)
             end
         end
         if nextDescription ~= nil then
+            field.DescriptionSource = nextDescription
             field.Description = self.Section.Window:_resolveLocalizedText(nextDescription)
             fieldBodies[fieldIndex].Text = field.Description
         end
@@ -1482,7 +1541,10 @@ function Section:AddParagraph(options)
         assert(type(values) == "table", "SetFields expects a table")
         for index, value in ipairs(values) do
             if fields[index] and fieldBodies[index] then
-                fields[index].Description = self.Section.Window:_resolveLocalizedText(type(value) == "table" and (value.Description or value.Content or value.Text or "") or value)
+                local descriptionSource = type(value) == "table" and not isLocalizedPair(value)
+                    and (value.Description or value.Content or value.Text or "") or value
+                fields[index].DescriptionSource = descriptionSource
+                fields[index].Description = self.Section.Window:_resolveLocalizedText(descriptionSource)
                 fieldBodies[index].Text = fields[index].Description
             end
         end
