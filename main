@@ -7,10 +7,11 @@ local Assets = {
 local Lucide = loadstring(game:HttpGet("https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"))()
 
 local Library = {
-    Version = "1.6.0",
+    Version = "1.7.0",
     Windows = {},
     SupportsLucideIcons = Lucide ~= nil,
     SupportsAutoLoad = true,
+    SupportsPerAccountConfigs = true,
     _lastWindow = nil,
 }
 
@@ -584,13 +585,57 @@ local function getGuiParent(preferredParent, useExecutorGui)
     return Runtime:ResolveParent(preferredParent, useExecutorGui)
 end
 
--- Configs are stored below one common root.  ConfigFolder is intentionally a
--- *game-specific* subfolder, so `ConfigFolder = "GAG2"` resolves to
--- `Averlik Hub/Configs/GAG2` rather than mixing this game's configs with
--- every other script's configs.
+-- Configs are stored below one common root and are isolated by Roblox account.
+-- ConfigFolder is an optional *game-specific* subfolder, so
+-- `ConfigFolder = "GAG2"` resolves to
+-- `Averlik Hub/Configs/<UserId>/GAG2` rather than mixing accounts or games.
 local DEFAULT_CONFIG_ROOT = "Averlik Hub/Configs"
 local DEFAULT_CONFIG_EXTENSION = ".json"
 local CONFIG_TYPE_KEY = "__averlikType"
+-- Config files are isolated per Roblox account.  The UserId segment is added
+-- below the root before any optional game/config folder, so accounts on the
+-- same device never see one another's files.
+local UNKNOWN_CONFIG_USER = "UnknownUser"
+-- LocalPlayer can be missing for a moment while a script is starting.  Waiting a
+-- few frames keeps configs in the real account folder instead of dropping them
+-- into the shared placeholder folder because of a startup race.
+local CONFIG_USER_WAIT_TICKS = 10
+
+local function readConfigUserId()
+    local localPlayer = Players.LocalPlayer
+    local userId = localPlayer and tonumber(localPlayer.UserId)
+    if userId and userId > 0 then
+        return tostring(math.floor(userId))
+    end
+    return nil
+end
+
+local function waitForConfigUserId()
+    local userId = readConfigUserId()
+    if userId then
+        return userId
+    end
+    for _ = 1, CONFIG_USER_WAIT_TICKS do
+        -- task.wait cannot be called from every context (for example inside a
+        -- RenderStepped callback), so a failure simply stops the wait.
+        local waited = pcall(task.wait)
+        if not waited then
+            break
+        end
+        userId = readConfigUserId()
+        if userId then
+            return userId
+        end
+    end
+    -- Keep a stable, non-account fallback rather than constructing an invalid
+    -- path or throwing during window creation.
+    return nil
+end
+
+local function getConfigUserFolder()
+    return waitForConfigUserId() or UNKNOWN_CONFIG_USER
+end
+
 -- This folder lives inside the current game's ConfigFolder.  It holds library
 -- metadata (rather than a user config), so every game keeps its own auto-load
 -- choice and List() never exposes the metadata as a selectable config.
@@ -741,6 +786,110 @@ local function ensureConfigFolder(folder)
     return true
 end
 
+local MIGRATION_MARKER_FILE = ".migrated"
+
+-- Returns the shared, account-agnostic folder used by the previous (flat)
+-- config layout: `<root>/<ConfigFolder>` without a UserId segment.  When no
+-- ConfigFolder was configured the legacy root itself is returned.  Legacy
+-- configs are copied from here into the per-account folder on first use so an
+-- upgrade never loses a user's saved settings.
+local function getLegacyConfigPath(root, folder)
+    if folder == nil or folder == "" then
+        return root
+    end
+    return root .. "/" .. folder
+end
+
+-- Best-effort legacy filesystem helpers.  Reading a missing legacy folder must
+-- never surface as an error: a fresh install simply has no legacy configs to
+-- migrate, and the executor filesystem may be unavailable entirely.
+local function normalizePathSeparators(path)
+    return string.gsub(string.gsub(tostring(path or ""), "\\", "/"), "/+$", "")
+end
+
+-- Some executors answer listfiles with absolute paths, others with plain file
+-- names.  Only direct children of the legacy folder are treated as migratable
+-- configs, so library metadata (`.averlik`) is never copied as a user config.
+-- Returns `files` or `nil, errorMessage`.  A missing legacy folder is not an
+-- error: it simply means there is nothing to migrate.  A filesystem failure is
+-- reported instead of being mistaken for "nothing to migrate", which keeps the
+-- migration marker from being written before the copy could actually run.
+local function legacyConfigFiles(path)
+    if path == nil or path == "" then
+        return {}
+    end
+    local available, availabilityError = requireFilesystemFunctions("isfolder", "listfiles", "isfile")
+    if not available then
+        return nil, availabilityError
+    end
+    local normalizedFolder = normalizePathSeparators(path)
+    local folderChecked, isFolder = callFilesystem("isfolder", normalizedFolder)
+    if not folderChecked then
+        return nil, "Unable to inspect legacy config folder: " .. tostring(isFolder)
+    end
+    if not isFolder then
+        return {}
+    end
+    local listed, entries = callFilesystem("listfiles", normalizedFolder)
+    if not listed then
+        return nil, "Unable to list legacy config folder: " .. tostring(entries)
+    end
+    if type(entries) ~= "table" then
+        return {}
+    end
+
+    local files = {}
+    for _, entry in ipairs(entries) do
+        if type(entry) == "string" then
+            local normalizedEntry = normalizePathSeparators(entry)
+            local filename = string.match(normalizedEntry, "([^/]+)$") or normalizedEntry
+            local parent = string.match(normalizedEntry, "^(.+)/[^/]+$")
+            local isDirectChild = parent == nil or parent == normalizedFolder
+            -- Plain names are relative to the legacy folder, absolute entries
+            -- already point at the file itself.
+            local candidate = parent == nil and normalizedFolder .. "/" .. filename or normalizedEntry
+            local fileChecked, isFile = callFilesystem("isfile", candidate)
+            if not fileChecked then
+                return nil, "Unable to inspect legacy config: " .. tostring(isFile)
+            end
+            if isFile
+                and string.sub(filename, 1, 1) ~= "."
+                and filename ~= AUTOLOAD_FILE_NAME
+            then
+                table.insert(files, filename)
+            end
+        end
+    end
+    return files
+end
+
+local function legacyReadFile(path)
+    if path == nil or path == "" then
+        return nil
+    end
+    local available = requireFilesystemFunctions("isfile", "readfile")
+    if not available then
+        return nil
+    end
+    local checked, exists = callFilesystem("isfile", path)
+    if not checked or not exists then
+        return nil
+    end
+    local read, contents = callFilesystem("readfile", path)
+    if not read or type(contents) ~= "string" then
+        return nil
+    end
+    return contents
+end
+
+local function legacyWriteFile(path, contents)
+    if path == nil or path == "" then
+        return false
+    end
+    local written = callFilesystem("writefile", path, contents)
+    return written == true
+end
+
 local function serializeConfigValue(value, seen)
     local valueType = typeof(value)
     if valueType == "Color3" then
@@ -796,11 +945,37 @@ local function serializeConfigValue(value, seen)
     return result
 end
 
+-- Older builds wrote a Colour as a plain `{ R = .., G = .., B = .. }` table
+-- without the type marker, sometimes on the 0-255 scale.  Restore it instead of
+-- handing an unusable table to the colour control.
+local function legacyColorFromTable(value)
+    if type(value.R) ~= "number" or type(value.G) ~= "number" or type(value.B) ~= "number" then
+        return nil
+    end
+    for key in pairs(value) do
+        if key ~= "R" and key ~= "G" and key ~= "B" and key ~= "A" then
+            return nil
+        end
+    end
+    local scale = (value.R > 1 or value.G > 1 or value.B > 1) and 255 or 1
+    return Color3.new(
+        math.clamp(value.R / scale, 0, 1),
+        math.clamp(value.G / scale, 0, 1),
+        math.clamp(value.B / scale, 0, 1)
+    )
+end
+
 local function deserializeConfigValue(value)
     if type(value) ~= "table" then
         return value
     end
     local valueType = value[CONFIG_TYPE_KEY]
+    if valueType == nil then
+        local legacyColor = legacyColorFromTable(value)
+        if legacyColor then
+            return legacyColor
+        end
+    end
     if valueType == "Color3" then
         if type(value.R) ~= "number" or type(value.G) ~= "number" or type(value.B) ~= "number" then
             return nil, "invalid Color3 value"
@@ -812,9 +987,16 @@ local function deserializeConfigValue(value)
         )
     end
     if valueType == "EnumItem" then
-        local enumType = type(value.EnumType) == "string" and Enum[value.EnumType] or nil
-        local enumItem = enumType and type(value.Name) == "string" and enumType[value.Name] or nil
-        if not enumItem then
+        if type(value.EnumType) ~= "string" or type(value.Name) ~= "string" then
+            return nil, "invalid enum value"
+        end
+        -- Indexing Enum with an unknown type or name raises instead of
+        -- returning nil, so both lookups stay inside pcall.
+        local resolved, enumItem = pcall(function()
+            local enumType = Enum[value.EnumType]
+            return enumType and enumType[value.Name] or nil
+        end)
+        if not resolved or typeof(enumItem) ~= "EnumItem" then
             return nil, "invalid enum value"
         end
         return enumItem
@@ -4691,6 +4873,143 @@ function Window:Notify(options)
     return toast
 end
 
+-- Copies legacy shared-folder configs into this account's folder once.  The
+-- marker lives in the account metadata folder, so each Roblox account migrates
+-- independently and the shared legacy files are left untouched.
+function Configurations:_hasMigratedLegacy()
+    local path = self.MetadataFolder .. "/" .. MIGRATION_MARKER_FILE
+    local available = requireFilesystemFunctions("isfile")
+    if not available then
+        return false
+    end
+    local checked, exists = callFilesystem("isfile", path)
+    return checked and exists == true
+end
+
+function Configurations:_writeMigratedMarker()
+    local ready = ensureConfigFolder(self.MetadataFolder)
+    if not ready then
+        return false
+    end
+    local path = self.MetadataFolder .. "/" .. MIGRATION_MARKER_FILE
+    return legacyWriteFile(path, "1")
+end
+
+function Configurations:_migrateLegacy()
+    local legacyFolder = self.LegacyFolder
+    if legacyFolder == nil or legacyFolder == "" or legacyFolder == self.Folder then
+        -- Nothing lives outside this account's folder, so there is nothing to
+        -- copy.  Record it anyway so repeated calls stay cheap.
+        self:_writeMigratedMarker()
+        return true
+    end
+
+    local available, availabilityError = requireFilesystemFunctions(
+        "isfolder",
+        "makefolder",
+        "listfiles",
+        "isfile",
+        "readfile",
+        "writefile"
+    )
+    if not available then
+        -- Without a filesystem no config can be stored at all.  Do not record a
+        -- migration that never ran; the next call tries again.
+        return false, availabilityError
+    end
+
+    local ready, folderError = ensureConfigFolder(self.Folder)
+    if not ready then
+        return false, folderError
+    end
+
+    local legacyFiles, listError = legacyConfigFiles(legacyFolder)
+    if not legacyFiles then
+        return false, listError
+    end
+
+    local extension = self.Extension
+    local copied = 0
+    local copyError = nil
+    for _, filename in ipairs(legacyFiles) do
+        if string.sub(filename, -#extension) == extension then
+            local sourcePath = legacyFolder .. "/" .. filename
+            local targetPath = self.Folder .. "/" .. filename
+            local contents = legacyReadFile(sourcePath)
+            if contents ~= nil then
+                local checked, exists = callFilesystem("isfile", targetPath)
+                if checked and not exists then
+                    if legacyWriteFile(targetPath, contents) then
+                        copied = copied + 1
+                    elseif copyError == nil then
+                        copyError = "Unable to migrate '" .. filename .. "'"
+                    end
+                end
+            end
+        end
+    end
+
+    if copyError then
+        return false, copyError
+    end
+
+    -- Carry the shared auto-load choice over as well, so the remembered config
+    -- keeps loading after an upgrade.  It is copied (never moved) into this
+    -- account's metadata folder, which keeps the accounts independent: clearing
+    -- auto-load on one account cannot affect another one.
+    local legacyAutoLoad = legacyReadFile(
+        self.LegacyMetadataFolder .. "/" .. AUTOLOAD_FILE_NAME
+    )
+    if legacyAutoLoad ~= nil then
+        local autoLoadPath = self:_getAutoLoadPath()
+        local checked, exists = callFilesystem("isfile", autoLoadPath)
+        if checked and not exists then
+            local metadataReady = ensureConfigFolder(self.MetadataFolder)
+            if metadataReady and legacyWriteFile(autoLoadPath, legacyAutoLoad) then
+                copied = copied + 1
+            end
+        end
+    end
+
+    self:_writeMigratedMarker()
+    return true, copied
+end
+
+-- Public entry point.  Legacy configs are migrated automatically before any
+-- list/save/load call, so scripts normally never need this.  Returns
+-- `true, copiedCount` or `false, errorMessage`.
+function Configurations:Migrate()
+    if self:_hasMigratedLegacy() then
+        self._migrationDone = true
+        return true, 0
+    end
+    local migrated, result = self:_migrateLegacy()
+    if migrated then
+        self._migrationDone = true
+        return true, result or 0
+    end
+    return false, result or "Unable to migrate legacy configs"
+end
+
+-- Ensures legacy configs are available for this account before a mutating
+-- operation touches the per-account folder.  Migration is safe to call
+-- repeatedly: once the marker exists it does nothing.
+function Configurations:_ensureMigrated()
+    if self._migrationDone then
+        return true
+    end
+    if self:_hasMigratedLegacy() then
+        self._migrationDone = true
+        return true
+    end
+    local migrated, result = self:_migrateLegacy()
+    if migrated then
+        self._migrationDone = true
+        return true
+    end
+    return false, result
+end
+
 function Configurations:_resolvePath(name)
     local configName, nameError = normalizeConfigName(name, self.Extension)
     if not configName then
@@ -4711,6 +5030,8 @@ function Configurations:GetAutoLoad()
     if not available then
         return false, availabilityError
     end
+
+    self:_ensureMigrated()
 
     local path = self:_getAutoLoadPath()
     local checked, exists = callFilesystem("isfile", path)
@@ -4748,6 +5069,7 @@ function Configurations:SetAutoLoad(name)
     if not available then
         return false, availabilityError
     end
+    self:_ensureMigrated()
 
     local folderReady, folderError = ensureConfigFolder(self.Folder)
     if not folderReady then
@@ -4821,6 +5143,47 @@ function Configurations:LoadAutoLoad()
     return loaded, configName, result
 end
 
+-- Accepts both stored shapes so upgrading never errors on an older file:
+--   { Version = 1, Values = { flag = value } }  (current)
+--   { flag = value }                            (legacy flat map)
+-- Reserved metadata keys are ignored, which keeps library-internal entries from
+-- being applied to a control that happens to share a name.
+local CONFIG_RESERVED_KEYS = {
+    Version = true,
+    Values = true,
+    UserId = true,
+    Saved = true,
+    SavedAt = true,
+    Library = true,
+    LibraryVersion = true,
+}
+
+local function extractConfigValues(decoded)
+    if type(decoded) ~= "table" then
+        return nil, "expected a JSON object"
+    end
+    if type(decoded.Values) == "table" then
+        return decoded.Values
+    end
+    if decoded.Values ~= nil then
+        return nil, "Values must be an object"
+    end
+
+    -- Legacy flat layout: every non-reserved key is treated as a flag.
+    local values = {}
+    local found = false
+    for key, value in pairs(decoded) do
+        if type(key) == "string" and not CONFIG_RESERVED_KEYS[key] then
+            values[key] = value
+            found = true
+        end
+    end
+    if not found then
+        return nil, "no saved values found"
+    end
+    return values
+end
+
 function Configurations:_serialize()
     local values = {}
     for _, control in ipairs(self.Window._configControls) do
@@ -4835,8 +5198,11 @@ function Configurations:_serialize()
             end
         end
     end
+    -- UserId is recorded for readability only.  Load ignores reserved keys, so
+    -- a config copied between accounts still loads without complaints.
     local encoded, encodeError = pcall(HttpService.JSONEncode, HttpService, {
         Version = 1,
+        UserId = tonumber(self.UserId) or self.UserId,
         Values = values,
     })
     if not encoded then
@@ -4850,6 +5216,7 @@ function Configurations:List()
     if not available then
         return nil, availabilityError
     end
+    self:_ensureMigrated()
     local folderReady, folderError = ensureConfigFolder(self.Folder)
     if not folderReady then
         return nil, folderError
@@ -4860,13 +5227,19 @@ function Configurations:List()
     end
 
     local configs = {}
-    for _, path in ipairs(files or {}) do
-        if type(path) == "string" then
-            local fileChecked, isFile = callFilesystem("isfile", path)
+    for _, entry in ipairs(files or {}) do
+        if type(entry) == "string" then
+            local normalizedEntry = normalizePathSeparators(entry)
+            local filename = string.match(normalizedEntry, "([^/]+)$") or normalizedEntry
+            -- Entries may be absolute paths or plain names depending on the
+            -- executor; a plain name is resolved against this account's folder.
+            local candidate = string.find(normalizedEntry, "/", 1, true)
+                and normalizedEntry
+                or self.Folder .. "/" .. filename
+            local fileChecked, isFile = callFilesystem("isfile", candidate)
             if not fileChecked then
                 return nil, "Unable to inspect config file: " .. tostring(isFile)
             end
-            local filename = string.match(path, "([^/\\]+)$") or path
             if isFile and string.sub(filename, -#self.Extension) == self.Extension then
                 table.insert(configs, string.sub(filename, 1, #filename - #self.Extension))
             end
@@ -4887,6 +5260,7 @@ function Configurations:Create(name)
     if not available then
         return false, availabilityError
     end
+    self:_ensureMigrated()
     local folderReady, folderError = ensureConfigFolder(self.Folder)
     if not folderReady then
         return false, folderError
@@ -4910,6 +5284,7 @@ function Configurations:Save(name)
     if not available then
         return false, availabilityError
     end
+    self:_ensureMigrated()
     local folderReady, folderError = ensureConfigFolder(self.Folder)
     if not folderReady then
         return false, folderError
@@ -4934,6 +5309,7 @@ function Configurations:Load(name)
     if not available then
         return false, availabilityError
     end
+    self:_ensureMigrated()
     local folderReady, folderError = ensureConfigFolder(self.Folder)
     if not folderReady then
         return false, folderError
@@ -4950,19 +5326,37 @@ function Configurations:Load(name)
         return false, "Unable to read config: " .. tostring(contents)
     end
     local decoded, decodeError = pcall(HttpService.JSONDecode, HttpService, contents)
-    if not decoded or type(decodeError) ~= "table" or type(decodeError.Values) ~= "table" then
+    if not decoded or type(decodeError) ~= "table" then
         return false, "Config '" .. configName .. "' is not valid JSON"
+    end
+    local configValues, valuesError = extractConfigValues(decodeError)
+    if not configValues then
+        return false, "Config '" .. configName .. "' is not valid JSON: " .. tostring(valuesError)
     end
 
     local preparedValues = {}
-    for flag, value in pairs(decodeError.Values) do
+    local skipped = {}
+    for flag, value in pairs(configValues) do
         if type(flag) == "string" then
             local deserialized, deserializeError = deserializeConfigValue(value)
             if deserialized == nil and deserializeError then
-                return false, "Cannot load '" .. flag .. "': " .. tostring(deserializeError)
+                -- One value written by an older version (an unknown key name, a
+                -- removed enum, a hand-edited colour) must not discard the whole
+                -- config.  Skip it and keep applying everything else.
+                table.insert(skipped, flag)
+            else
+                preparedValues[flag] = deserialized
             end
-            preparedValues[flag] = deserialized
         end
+    end
+    if #skipped > 0 then
+        table.sort(skipped)
+        warn(
+            "[Averlik UI] config '"
+                .. configName
+                .. "' skipped unsupported values: "
+                .. table.concat(skipped, ", ")
+        )
     end
 
     -- Controls that only store values (dropdowns, sliders, textboxes, etc.)
@@ -5020,6 +5414,7 @@ function Configurations:Delete(name)
     if not available then
         return false, availabilityError
     end
+    self:_ensureMigrated()
     local folderReady, folderError = ensureConfigFolder(self.Folder)
     if not folderReady then
         return false, folderError
@@ -5069,6 +5464,11 @@ function Window:DeleteConfig(name)
 end
 
 Window.GetConfigs = Window.ListConfigs
+
+-- Forces the one-time copy of legacy shared configs into this account's folder.
+function Window:MigrateConfigs()
+    return self.Configs:Migrate()
+end
 
 function Window:GetAutoLoadConfig()
     return self.Configs:GetAutoLoad()
@@ -5184,7 +5584,14 @@ function Library:CreateWindow(options)
     assert(configRoot, configRootError)
     local configFolder, configFolderError = normalizeConfigFolder(options.ConfigFolder)
     assert(configFolder ~= nil, configFolderError)
-    local configPath = configFolder == "" and configRoot or configRoot .. "/" .. configFolder
+    local configUserId = getConfigUserFolder()
+    local userConfigRoot = configRoot .. "/" .. configUserId
+    local configPath = configFolder == "" and userConfigRoot or userConfigRoot .. "/" .. configFolder
+    -- The layout used before per-account isolation: configs sat directly in the
+    -- shared root (optionally inside ConfigFolder).  It is only read from, never
+    -- written to, so legacy files keep working for every account on the device.
+    local legacyConfigPath = getLegacyConfigPath(configRoot, configFolder)
+    local legacyMetadataPath = legacyConfigPath .. "/" .. CONFIG_METADATA_FOLDER
     local configExtension, configExtensionError = normalizeConfigExtension(options.ConfigExtension)
     assert(configExtension, configExtensionError)
     local parent, hostKind = getGuiParent(options.Parent, options.UseExecutorGui)
@@ -5735,8 +6142,10 @@ function Library:CreateWindow(options)
         _expandedSize = size,
         ToggleKey = nil,
         ConfigRoot = configRoot,
+        ConfigUserId = configUserId,
         ConfigFolder = configFolder,
         ConfigPath = configPath,
+        ConfigLegacyPath = legacyConfigPath,
         ConfigExtension = configExtension,
         _configControls = {},
         _configControlsByFlag = {},
@@ -5747,10 +6156,14 @@ function Library:CreateWindow(options)
     window.Configs = setmetatable({
         Window = window,
         Root = configRoot,
+        UserId = window.ConfigUserId,
         Folder = configPath,
         MetadataFolder = configPath .. "/" .. CONFIG_METADATA_FOLDER,
+        LegacyFolder = legacyConfigPath,
+        LegacyMetadataFolder = legacyMetadataPath,
         GameFolder = configFolder,
         Extension = configExtension,
+        _migrationDone = false,
     }, Configurations)
     window.Config = window.Configs
     -- text() and button() keep their default text colour as an explicit theme
