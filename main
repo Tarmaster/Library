@@ -5,7 +5,7 @@ local Assets = {
 
 -- Lucide is loaded once; all UI icons use the asset returned by GetAsset(name).
 local Lucide = loadstring(game:HttpGet("https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"))()
-
+print("v3.2")
 local Library = {
     Version = "1.7.0",
     Windows = {},
