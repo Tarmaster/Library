@@ -641,6 +641,11 @@ end
 -- choice and List() never exposes the metadata as a selectable config.
 local CONFIG_METADATA_FOLDER = ".averlik"
 local AUTOLOAD_FILE_NAME = "autoload.json"
+-- Configs can also be written to one shared folder that every Roblox account on
+-- this device reads.  It occupies the UserId segment with a reserved name, so it
+-- can never collide with a numeric account folder.
+local SHARED_CONFIG_USER = "Shared"
+local SHARED_FILE_NAME = "shared.json"
 
 local function trimString(value)
     return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
@@ -798,6 +803,18 @@ local function getLegacyConfigPath(root, folder)
         return root
     end
     return root .. "/" .. folder
+end
+
+-- Returns the account-agnostic folder used while the shared-config toggle is on:
+-- `<root>/Shared/<ConfigFolder>`.  Configs written here are listed, loaded and
+-- deleted by every Roblox account on the device, while configs in a UserId
+-- folder stay private to that account.
+local function getSharedConfigPath(root, folder)
+    local sharedRoot = root .. "/" .. SHARED_CONFIG_USER
+    if folder == nil or folder == "" then
+        return sharedRoot
+    end
+    return sharedRoot .. "/" .. folder
 end
 
 -- Best-effort legacy filesystem helpers.  Reading a missing legacy folder must
@@ -5010,12 +5027,190 @@ function Configurations:_ensureMigrated()
     return false, result
 end
 
-function Configurations:_resolvePath(name)
+function Configurations:_getSharedPreferencePath()
+    return self.MetadataFolder .. "/" .. SHARED_FILE_NAME
+end
+
+-- Returns `enabled`, or nil when this account has not chosen yet, plus an error
+-- message when a stored preference could not be read.
+function Configurations:_readSharedPreference()
+    local available, availabilityError = requireFilesystemFunctions("isfile", "readfile")
+    if not available then
+        return nil, availabilityError
+    end
+    local path = self:_getSharedPreferencePath()
+    local checked, exists = callFilesystem("isfile", path)
+    if not checked then
+        return nil, "Unable to inspect shared-config setting: " .. tostring(exists)
+    end
+    if not exists then
+        return nil
+    end
+    local read, contents = callFilesystem("readfile", path)
+    if not read then
+        return nil, "Unable to read shared-config setting: " .. tostring(contents)
+    end
+    local decoded, decodeError = pcall(HttpService.JSONDecode, HttpService, contents)
+    if not decoded or type(decodeError) ~= "table" then
+        -- A hand-edited or truncated file must never break config saving, so it
+        -- falls back to the private per-account folder.
+        return nil, "Shared-config setting is not valid JSON"
+    end
+    return decodeError.Shared == true
+end
+
+-- Reports whether new configs are written to the shared folder.  The choice is
+-- remembered per Roblox account, so enabling it on one account never changes
+-- where another account saves.  Without a stored preference the window's
+-- `SharedConfigs` option decides.  Returns `enabled` plus an error message when
+-- the stored preference could not be read; the result is cached because only
+-- SetShared changes it.
+function Configurations:GetShared()
+    if self._sharedLoaded then
+        return self._shared, self._sharedError
+    end
+    local stored, readError = self:_readSharedPreference()
+    if stored == nil then
+        self._shared = self.SharedConfigs == true
+    else
+        self._shared = stored
+    end
+    self._sharedError = readError
+    self._sharedLoaded = true
+    return self._shared, self._sharedError
+end
+
+function Configurations:SetShared(enabled)
+    enabled = enabled == true
+    local available, availabilityError = requireFilesystemFunctions("isfile", "writefile")
+    if not available then
+        return false, availabilityError
+    end
+    local metadataReady, metadataError = ensureConfigFolder(self.MetadataFolder)
+    if not metadataReady then
+        return false, metadataError
+    end
+    local encoded, encodeError = pcall(HttpService.JSONEncode, HttpService, {
+        Version = 1,
+        Shared = enabled,
+    })
+    if not encoded then
+        return false, "Unable to encode shared-config setting: " .. tostring(encodeError)
+    end
+    local written, writeError = callFilesystem("writefile", self:_getSharedPreferencePath(), encodeError)
+    if not written then
+        return false, "Unable to save shared-config setting: " .. tostring(writeError)
+    end
+    self._shared = enabled
+    self._sharedError = nil
+    self._sharedLoaded = true
+    return true, enabled
+end
+
+-- The folder new configs are written to: the shared one while shared configs are
+-- on, otherwise this account's private folder.
+function Configurations:_activeFolder()
+    local shared = self.SharedFolder
+    if self:GetShared() and type(shared) == "string" and shared ~= "" then
+        return shared
+    end
+    return self.Folder
+end
+
+-- A read (list, load, delete) only creates this account's own folder.  The
+-- shared folder is created when something is actually written there, so a failed
+-- load never leaves an empty shared folder behind.
+function Configurations:_ensureReadFolder(folder)
+    if folder ~= self.Folder then
+        return true
+    end
+    return ensureConfigFolder(folder)
+end
+
+-- Every folder that can hold a config for this window, in resolution order: the
+-- selected scope first and the other one as a fallback.  Both are always listed,
+-- so a config saved on one account stays visible on every other account no
+-- matter how the shared toggle is currently set.
+function Configurations:_configFolders()
+    local active = self:_activeFolder()
+    local folders = { active }
+    local other = active == self.Folder and self.SharedFolder or self.Folder
+    if type(other) == "string" and other ~= "" and other ~= active then
+        table.insert(folders, other)
+    end
+    return folders
+end
+
+-- Returns the first folder that already holds `filename` plus an error message
+-- when the filesystem could not be inspected.  A nil folder without an error
+-- means the config does not exist in either scope.  Read operations use it so a
+-- config stays loadable and deletable after the toggle is switched.
+function Configurations:_findExistingFolder(filename)
+    local available, availabilityError = requireFilesystemFunctions("isfile")
+    if not available then
+        return nil, availabilityError
+    end
+    for _, folder in ipairs(self:_configFolders()) do
+        local checked, exists = callFilesystem("isfile", folder .. "/" .. filename)
+        if not checked then
+            return nil, "Unable to inspect config: " .. tostring(exists)
+        end
+        if exists then
+            return folder
+        end
+    end
+    return nil
+end
+
+-- Returns `path, configName, folder`.  With `existingOnly` the folder that
+-- already holds the config is used, which lets Load and Delete reach a shared
+-- config while the toggle is off and vice versa; otherwise the folder selected
+-- by the toggle is used.
+function Configurations:_resolvePath(name, existingOnly)
     local configName, nameError = normalizeConfigName(name, self.Extension)
     if not configName then
         return nil, nameError
     end
-    return self.Folder .. "/" .. configName .. self.Extension, configName
+    local filename = configName .. self.Extension
+    if existingOnly then
+        -- Legacy configs are copied into this account's folder first, so a
+        -- config that only exists in the legacy layout is still found.
+        self:_ensureMigrated()
+        local existing = self:_findExistingFolder(filename)
+        if existing then
+            return existing .. "/" .. filename, configName, existing
+        end
+    end
+    local active = self:_activeFolder()
+    return active .. "/" .. filename, configName, active
+end
+
+-- A name can exist in both scopes at once.  The selected scope wins for loading
+-- and deleting, so the other copy stays out of sight until the toggle is
+-- switched.  Say so instead of leaving the user guessing.
+function Configurations:_warnShadowed(configName, writtenFolder)
+    local other = writtenFolder == self.Folder and self.SharedFolder or self.Folder
+    if type(other) ~= "string" or other == "" or other == writtenFolder then
+        return
+    end
+    local available = requireFilesystemFunctions("isfile")
+    if not available then
+        return
+    end
+    local checked, exists = callFilesystem("isfile", other .. "/" .. configName .. self.Extension)
+    if checked and exists then
+        local hiddenScope = writtenFolder == self.Folder and "shared" or "account"
+        local usedScope = writtenFolder == self.Folder and "account" or "shared"
+        warn(
+            "[Averlik UI] config '"
+                .. configName
+                .. "' also exists in the "
+                .. hiddenScope
+                .. " folder and stays hidden while the "
+                .. usedScope
+                .. " folder is selected"
+        )
+    end
 end
 
 function Configurations:_getAutoLoadPath()
@@ -5059,9 +5254,10 @@ end
 
 -- Stores a config as the auto-load choice for this window's ConfigFolder.
 -- The config must already exist, preventing a broken selection from being
--- written by a toggle before the user has chosen a config.
+-- written by a toggle before the user has chosen a config.  A shared config can
+-- be remembered too; the choice itself always stays private to this account.
 function Configurations:SetAutoLoad(name)
-    local configPath, configName = self:_resolvePath(name)
+    local configPath, configName, configFolder = self:_resolvePath(name, true)
     if not configPath then
         return false, configName
     end
@@ -5071,7 +5267,7 @@ function Configurations:SetAutoLoad(name)
     end
     self:_ensureMigrated()
 
-    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    local folderReady, folderError = self:_ensureReadFolder(configFolder)
     if not folderReady then
         return false, folderError
     end
@@ -5152,6 +5348,7 @@ local CONFIG_RESERVED_KEYS = {
     Version = true,
     Values = true,
     UserId = true,
+    Shared = true,
     Saved = true,
     SavedAt = true,
     Library = true,
@@ -5198,11 +5395,13 @@ function Configurations:_serialize()
             end
         end
     end
-    -- UserId is recorded for readability only.  Load ignores reserved keys, so
-    -- a config copied between accounts still loads without complaints.
+    -- UserId and Shared are recorded for readability only.  Load ignores
+    -- reserved keys, so a config copied between accounts or between the private
+    -- and the shared folder still loads without complaints.
     local encoded, encodeError = pcall(HttpService.JSONEncode, HttpService, {
         Version = 1,
         UserId = tonumber(self.UserId) or self.UserId,
+        Shared = self:GetShared() == true,
         Values = values,
     })
     if not encoded then
@@ -5211,17 +5410,28 @@ function Configurations:_serialize()
     return encodeError
 end
 
-function Configurations:List()
-    local available, availabilityError = requireFilesystemFunctions("isfile", "listfiles")
-    if not available then
-        return nil, availabilityError
+-- Lists the config names directly inside one folder.  This account's own folder
+-- is created when missing so an empty list stays a usable result; any other
+-- folder is only read, which keeps the shared folder from being created before
+-- something is actually shared.  Returns `names` or `nil, errorMessage`.
+function Configurations:_listFolder(folder, createWhenMissing)
+    if createWhenMissing then
+        local ready, folderError = ensureConfigFolder(folder)
+        if not ready then
+            return nil, folderError
+        end
+    else
+        local available = requireFilesystemFunctions("isfolder")
+        if not available then
+            return {}
+        end
+        local checked, isFolder = callFilesystem("isfolder", folder)
+        if not checked or not isFolder then
+            return {}
+        end
     end
-    self:_ensureMigrated()
-    local folderReady, folderError = ensureConfigFolder(self.Folder)
-    if not folderReady then
-        return nil, folderError
-    end
-    local listed, files = callFilesystem("listfiles", self.Folder)
+
+    local listed, files = callFilesystem("listfiles", folder)
     if not listed then
         return nil, "Unable to list configs: " .. tostring(files)
     end
@@ -5232,10 +5442,10 @@ function Configurations:List()
             local normalizedEntry = normalizePathSeparators(entry)
             local filename = string.match(normalizedEntry, "([^/]+)$") or normalizedEntry
             -- Entries may be absolute paths or plain names depending on the
-            -- executor; a plain name is resolved against this account's folder.
+            -- executor; a plain name is resolved against the listed folder.
             local candidate = string.find(normalizedEntry, "/", 1, true)
                 and normalizedEntry
-                or self.Folder .. "/" .. filename
+                or folder .. "/" .. filename
             local fileChecked, isFile = callFilesystem("isfile", candidate)
             if not fileChecked then
                 return nil, "Unable to inspect config file: " .. tostring(isFile)
@@ -5245,14 +5455,53 @@ function Configurations:List()
             end
         end
     end
+    return configs
+end
+
+-- Lists every config this window can use: the ones owned by this account plus
+-- the shared ones.  Names are merged, so a config saved on one account shows up
+-- in the dropdown of every other account.  A name that exists in both scopes is
+-- listed once and resolves to the scope the toggle selects, which is also the
+-- file Load and Delete act on.
+function Configurations:List()
+    local available, availabilityError = requireFilesystemFunctions("isfile", "listfiles", "isfolder")
+    if not available then
+        return nil, availabilityError
+    end
+    self:_ensureMigrated()
+
+    local configs = {}
+    local seen = {}
+    for _, folder in ipairs(self:_configFolders()) do
+        local isAccountFolder = folder == self.Folder
+        local listed, listError = self:_listFolder(folder, isAccountFolder)
+        if listed then
+            for _, configName in ipairs(listed) do
+                if not seen[configName] then
+                    seen[configName] = true
+                    table.insert(configs, configName)
+                end
+            end
+        elseif isAccountFolder then
+            -- This account's own folder has to stay readable, otherwise the
+            -- dropdown would silently hide configs that do exist.
+            return nil, listError
+        end
+        -- An unreadable shared folder only hides shared configs, so the
+        -- account's own list stays usable.
+    end
     table.sort(configs, function(left, right)
         return string.lower(left) < string.lower(right)
     end)
     return configs
 end
 
+-- Create always targets the scope selected by the shared-config toggle and
+-- refuses to overwrite a file that is already there.  A config with the same
+-- name in the other scope is left untouched; Save is the explicit way to write
+-- over it.
 function Configurations:Create(name)
-    local path, configName = self:_resolvePath(name)
+    local path, configName, configFolder = self:_resolvePath(name)
     if not path then
         return false, configName
     end
@@ -5261,7 +5510,7 @@ function Configurations:Create(name)
         return false, availabilityError
     end
     self:_ensureMigrated()
-    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    local folderReady, folderError = ensureConfigFolder(configFolder)
     if not folderReady then
         return false, folderError
     end
@@ -5275,8 +5524,10 @@ function Configurations:Create(name)
     return self:Save(configName)
 end
 
+-- Writes the current values into the scope selected by the shared-config
+-- toggle, creating or replacing that file.
 function Configurations:Save(name)
-    local path, configName = self:_resolvePath(name)
+    local path, configName, configFolder = self:_resolvePath(name)
     if not path then
         return false, configName
     end
@@ -5285,7 +5536,7 @@ function Configurations:Save(name)
         return false, availabilityError
     end
     self:_ensureMigrated()
-    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    local folderReady, folderError = ensureConfigFolder(configFolder)
     if not folderReady then
         return false, folderError
     end
@@ -5297,11 +5548,15 @@ function Configurations:Save(name)
     if not written then
         return false, "Unable to save config: " .. tostring(writeError)
     end
+    self:_warnShadowed(configName, configFolder)
     return true, configName
 end
 
+-- Applies a stored config.  A config saved by another account (shared) or
+-- before the toggle was switched stays loadable: the selected scope is tried
+-- first and the other one is the fallback.
 function Configurations:Load(name)
-    local path, configName = self:_resolvePath(name)
+    local path, configName, configFolder = self:_resolvePath(name, true)
     if not path then
         return false, configName
     end
@@ -5310,7 +5565,7 @@ function Configurations:Load(name)
         return false, availabilityError
     end
     self:_ensureMigrated()
-    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    local folderReady, folderError = self:_ensureReadFolder(configFolder)
     if not folderReady then
         return false, folderError
     end
@@ -5405,8 +5660,11 @@ function Configurations:Load(name)
     return true, loaded
 end
 
+-- Removes one stored config: the copy in the selected scope when both scopes
+-- hold the same name, otherwise whichever copy exists.  Files owned by another
+-- scope are never removed as a side effect.
 function Configurations:Delete(name)
-    local path, configName = self:_resolvePath(name)
+    local path, configName, configFolder = self:_resolvePath(name, true)
     if not path then
         return false, configName
     end
@@ -5415,7 +5673,7 @@ function Configurations:Delete(name)
         return false, availabilityError
     end
     self:_ensureMigrated()
-    local folderReady, folderError = ensureConfigFolder(self.Folder)
+    local folderReady, folderError = self:_ensureReadFolder(configFolder)
     if not folderReady then
         return false, folderError
     end
@@ -5441,6 +5699,24 @@ function Configurations:Delete(name)
     return true, configName
 end
 
+-- Reports which scope a config name currently resolves to: `"shared"`,
+-- `"account"`, or nil when no such config exists.  Interfaces use it to tell the
+-- user where the config they just saved, loaded or deleted actually lives.
+function Configurations:GetScope(name)
+    local configName, nameError = normalizeConfigName(name, self.Extension)
+    if not configName then
+        return false, nameError
+    end
+    local folder, folderError = self:_findExistingFolder(configName .. self.Extension)
+    if folderError then
+        return false, folderError
+    end
+    if folder == nil then
+        return true, nil, configName
+    end
+    return true, folder == self.SharedFolder and "shared" or "account", configName
+end
+
 Configurations.GetConfigs = Configurations.List
 
 function Window:ListConfigs()
@@ -5464,6 +5740,25 @@ function Window:DeleteConfig(name)
 end
 
 Window.GetConfigs = Window.ListConfigs
+
+-- Shared configs live outside the per-account folder, so every Roblox account on
+-- this device lists, loads and saves the same files.  The choice is remembered
+-- per account, which keeps one account from changing where another one saves.
+-- GetSharedConfigs returns `enabled` plus an error message when the remembered
+-- choice could not be read, in which case the window's `SharedConfigs` option
+-- decides; SetSharedConfigs returns `true, enabled` or `false, errorMessage`.
+function Window:GetSharedConfigs()
+    return self.Configs:GetShared()
+end
+
+function Window:SetSharedConfigs(enabled)
+    return self.Configs:SetShared(enabled)
+end
+
+-- Returns `true, "shared"|"account"|nil, configName`.
+function Window:GetConfigScope(name)
+    return self.Configs:GetScope(name)
+end
 
 -- Forces the one-time copy of legacy shared configs into this account's folder.
 function Window:MigrateConfigs()
@@ -5592,6 +5887,10 @@ function Library:CreateWindow(options)
     -- written to, so legacy files keep working for every account on the device.
     local legacyConfigPath = getLegacyConfigPath(configRoot, configFolder)
     local legacyMetadataPath = legacyConfigPath .. "/" .. CONFIG_METADATA_FOLDER
+    -- The account-agnostic folder used while shared configs are on.  Every
+    -- Roblox account resolves the same path, so a config written here is listed
+    -- and loaded by all of them.  It is only created once something is shared.
+    local sharedConfigPath = getSharedConfigPath(configRoot, configFolder)
     local configExtension, configExtensionError = normalizeConfigExtension(options.ConfigExtension)
     assert(configExtension, configExtensionError)
     local parent, hostKind = getGuiParent(options.Parent, options.UseExecutorGui)
@@ -6146,6 +6445,7 @@ function Library:CreateWindow(options)
         ConfigFolder = configFolder,
         ConfigPath = configPath,
         ConfigLegacyPath = legacyConfigPath,
+        ConfigSharedPath = sharedConfigPath,
         ConfigExtension = configExtension,
         _configControls = {},
         _configControlsByFlag = {},
@@ -6161,8 +6461,11 @@ function Library:CreateWindow(options)
         MetadataFolder = configPath .. "/" .. CONFIG_METADATA_FOLDER,
         LegacyFolder = legacyConfigPath,
         LegacyMetadataFolder = legacyMetadataPath,
+        SharedFolder = sharedConfigPath,
         GameFolder = configFolder,
         Extension = configExtension,
+        SharedConfigs = options.SharedConfigs == true,
+        _sharedLoaded = false,
         _migrationDone = false,
     }, Configurations)
     window.Config = window.Configs
