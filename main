@@ -3,9 +3,19 @@ local Assets = {
     ["logo.jpg"] = "nil",
 }
 
--- Lucide is loaded once; all UI icons use the asset returned by GetAsset(name).
-local Lucide = loadstring(game:HttpGet("https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"))()
-print("v3.2")
+
+local Lucide
+pcall(function(...)
+    Lucide = loadstring(game:HttpGet("https://gitlab.com/upio/lucide-roblox-direct/-/raw/main/source.lua"))()
+end)
+
+if Lucide == nil then
+    Lucide.GetAsset = function(...)
+        return nil
+    end
+end
+
+
 local Library = {
     Version = "1.7.0",
     Windows = {},
@@ -6742,6 +6752,6 @@ Section.MultiDropdown = Section.AddMultiDropdown
 Section.Keybind = Section.AddKeybind
 Section.ColorPicker = Section.AddColorPicker
 
-print('load')
+print('load v1.33333')
 getgenv().Library = Library
 return Library
